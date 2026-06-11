@@ -1,0 +1,5 @@
+.env
+data/mmis.db
+data/images/
+__pycache__/
+*.pyc
