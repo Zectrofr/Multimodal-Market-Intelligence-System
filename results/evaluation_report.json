@@ -1,0 +1,203 @@
+{
+  "model_name": "MMIS Model",
+  "evaluation_date": "2026-06-11",
+  "n_predictions": 600,
+  "n_tickers": 6,
+  "date_range": {
+    "start": "2023-01-02",
+    "end": "2023-05-19"
+  },
+  "model": {
+    "strategy_name": "MMIS Model",
+    "total_return": -0.2063,
+    "annualised_return": -0.0925,
+    "sharpe": -0.3375,
+    "sortino": -0.5169,
+    "max_drawdown": 0.3986,
+    "calmar": -0.232,
+    "precision_at_up": 0.5252,
+    "hit_rate": 0.53,
+    "profit_factor": 0.9445,
+    "n_trades": 516,
+    "win_rate": 0.4864,
+    "avg_win": 0.01185,
+    "avg_loss": -0.01189
+  },
+  "benchmarks": {
+    "buy_and_hold": {
+      "strategy_name": "Buy & Hold",
+      "total_return": -0.3491,
+      "annualised_return": -0.165,
+      "sharpe": -0.6335,
+      "sortino": -1.0298,
+      "max_drawdown": 0.4953,
+      "calmar": -0.3331,
+      "precision_at_up": 0.5133,
+      "hit_rate": 0.5133,
+      "profit_factor": 0.9053,
+      "n_trades": 600,
+      "win_rate": 0.4767,
+      "avg_win": 0.01207,
+      "avg_loss": -0.01214
+    },
+    "random": {
+      "strategy_name": "Random",
+      "total_return": -0.2133,
+      "annualised_return": -0.0959,
+      "sharpe": -0.5151,
+      "sortino": -0.5793,
+      "max_drawdown": 0.3151,
+      "calmar": -0.3042,
+      "precision_at_up": 0.5034,
+      "hit_rate": 0.49,
+      "profit_factor": 0.8902,
+      "n_trades": 296,
+      "win_rate": 0.4595,
+      "avg_win": 0.01229,
+      "avg_loss": -0.01174
+    },
+    "momentum_5d": {
+      "strategy_name": "Momentum-5d",
+      "total_return": -0.3836,
+      "annualised_return": -0.1839,
+      "sharpe": -1.0807,
+      "sortino": -1.252,
+      "max_drawdown": 0.4483,
+      "calmar": -0.4101,
+      "precision_at_up": 0.4747,
+      "hit_rate": 0.46,
+      "profit_factor": 0.7914,
+      "n_trades": 316,
+      "win_rate": 0.4367,
+      "avg_win": 0.0123,
+      "avg_loss": -0.01205
+    }
+  },
+  "calibration": {
+    "ece": 0.05223,
+    "interpretation": "Moderate \u2014 model is somewhat overconfident",
+    "bins": {
+      "bin_lower": [
+        0.4,
+        0.5,
+        0.6,
+        0.7
+      ],
+      "bin_upper": [
+        0.5,
+        0.6,
+        0.7,
+        0.8
+      ],
+      "avg_confidence": [
+        0.4742,
+        0.5549,
+        0.6326,
+        0.7203
+      ],
+      "avg_accuracy": [
+        0.4405,
+        0.507,
+        0.5753,
+        0.4545
+      ],
+      "count": [
+        84,
+        359,
+        146,
+        11
+      ]
+    }
+  },
+  "per_ticker": {
+    "AAPL": {
+      "sharpe": -0.761,
+      "precision_at_up": 0.5169,
+      "total_return": -0.0621,
+      "n_trades": 89
+    },
+    "AMZN": {
+      "sharpe": 2.998,
+      "precision_at_up": 0.6125,
+      "total_return": 0.3067,
+      "n_trades": 80
+    },
+    "GOOGL": {
+      "sharpe": -1.9045,
+      "precision_at_up": 0.4667,
+      "total_return": -0.1742,
+      "n_trades": 90
+    },
+    "MSFT": {
+      "sharpe": -0.1964,
+      "precision_at_up": 0.5375,
+      "total_return": -0.0276,
+      "n_trades": 80
+    },
+    "NVDA": {
+      "sharpe": 1.2333,
+      "precision_at_up": 0.5412,
+      "total_return": 0.0944,
+      "n_trades": 85
+    },
+    "TSLA": {
+      "sharpe": -3.7904,
+      "precision_at_up": 0.4891,
+      "total_return": -0.2631,
+      "n_trades": 92
+    }
+  },
+  "per_regime": {
+    "high_vol": {
+      "sharpe": -1.1025,
+      "precision_at_up": 0.4831,
+      "total_return": -0.1839
+    },
+    "mean_reverting": {
+      "sharpe": 0.5954,
+      "precision_at_up": 0.5912,
+      "total_return": 0.0818
+    },
+    "trending": {
+      "sharpe": -0.4503,
+      "precision_at_up": 0.5084,
+      "total_return": -0.101
+    }
+  },
+  "uncertainty_filter": {
+    "0.005": {
+      "sharpe": 0.2505,
+      "precision_at_up": 0.587,
+      "n_trades": 138,
+      "coverage": 0.277
+    },
+    "0.01": {
+      "sharpe": -0.7726,
+      "precision_at_up": 0.5285,
+      "n_trades": 263,
+      "coverage": 0.508
+    },
+    "0.02": {
+      "sharpe": -0.2201,
+      "precision_at_up": 0.5273,
+      "n_trades": 421,
+      "coverage": 0.822
+    },
+    "0.05": {
+      "sharpe": -0.3375,
+      "precision_at_up": 0.5252,
+      "n_trades": 516,
+      "coverage": 1.0
+    }
+  },
+  "walk_forward": {
+    "folds": [],
+    "mean_sharpe": null,
+    "mean_precision_at_up": null
+  },
+  "vs_benchmarks": {
+    "sharpe_vs_bh": 0.296,
+    "sharpe_vs_random": 0.1776,
+    "return_vs_bh": 0.1428
+  }
+}
