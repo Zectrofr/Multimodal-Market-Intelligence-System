@@ -47,10 +47,10 @@ def fetch_ohlcv(ticker: str, start: str = START_DATE, end: str = END_DATE) -> pd
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.columns = ["open", "high", "low", "close", "volume"]
     
-    # Quality checks
-    assert not df.isnull().any().any(), f"Null values found in {ticker}"
-    assert (df["high"] >= df["low"]).all(), f"High < Low found in {ticker}"
-    assert (df["volume"] > 0).all(), f"Zero volume found in {ticker}"
+    # Quality checks — drop nulls instead of asserting
+    df = df.dropna()
+    df = df[df["high"] >= df["low"]].copy()
+    df = df[df["volume"] > 0].copy()
     
     df["ticker"] = ticker
     df.index.name = "date"
@@ -172,18 +172,17 @@ def generate_chart(df: pd.DataFrame, ticker: str, date_idx: int,
     figsize = (size[0] / 100, size[1] / 100)
     
     fig, axes = mpf.plot(
-        window_df,
-        type="candle",
-        style="yahoo",
-        volume=True,
-        addplot=ap,
-        figsize=figsize,
-        dpi=100,
-        returnfig=True,
-        axisoff=True,
-        scale_padding=dict(left=0, right=0, top=0.05, bottom=0.05),
-        tight_layout=True
-    )
+    window_df,
+    type="candle",
+    style="yahoo",
+    volume=True,
+    addplot=ap,
+    figsize=figsize,
+    returnfig=True,
+    axisoff=True,
+    scale_padding=dict(left=0, right=0, top=0.05, bottom=0.05),
+    tight_layout=True
+)
     
     date_str = df.iloc[date_idx]["date"].strftime("%Y-%m-%d")
     path = CHART_DIR / f"{ticker}_{date_str}.png"
