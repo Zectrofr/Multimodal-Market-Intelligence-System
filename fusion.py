@@ -4,6 +4,9 @@ Phase 4: Cross-Modal Attention Fusion
 Custom multi-head attention mechanism that dynamically combines
 market data (TFT), news sentiment (FinBERT), and visual features (EfficientNet).
 This is the core differentiator of the entire system.
+
+Phase 5 update: regime label (from regime.py) is now one-hot encoded
+and concatenated into the market feature vector.
 """
 
 import logging
@@ -42,6 +45,9 @@ EPOCHS = 30
 LR = 1e-4
 DROPOUT = 0.3
 MLFLOW_EXPERIMENT = "mmis_fusion"
+
+# Fixed order for regime one-hot encoding
+REGIME_ORDER = ["mean_reverting", "trending", "high_vol"]
 
 # ── Cross-Modal Attention Module ──────────────────────────────
 class CrossModalAttention(nn.Module):
@@ -170,12 +176,13 @@ class MultimodalDataset(Dataset):
 
 # ── Load and Align Data ───────────────────────────────────────
 def load_aligned_data(engine):
-    """Load and align all three modalities by date and ticker."""
+    """Load and align all three modalities by date and ticker.
+    Now also pulls 'regime' column (written by regime.py)."""
     logger.info("Loading data from database...")
 
-    # Market data
+    # Market data (now includes regime, duplicates removed)
     market_df = pd.read_sql("""
-        SELECT date, ticker, target,
+        SELECT date, ticker, target, regime,
                rsi_14, macd, macd_signal, macd_diff,
                ema_20, ema_50, bb_upper, bb_lower, bb_mid,
                bb_bandwidth, bb_position, atr_14,
@@ -183,8 +190,7 @@ def load_aligned_data(engine):
                volume_ratio, volume_change_1d,
                body_size, upper_shadow, lower_shadow, high_low_range,
                day_of_year_sin, day_of_year_cos, month_sin, month_cos,
-               open, high, low, close, volume,
-               rsi_14, macd_diff, bb_bandwidth
+               open, high, low, close, volume
         FROM market_data
     """, engine)
 
@@ -219,6 +225,10 @@ def load_aligned_data(engine):
     df["sentiment_neu"] = df["sentiment_neu"].fillna(1.0)
     df["sentiment_pos"] = df["sentiment_pos"].fillna(0.0)
 
+    # Fill missing regime (safety fallback — shouldn't trigger after
+    # `python regime.py --db data/mmis.db --all`)
+    df["regime"] = df["regime"].fillna("trending")
+
     # Drop rows without visual features
     df = df.dropna(subset=["feature_vector"])
     logger.info(f"Aligned rows: {len(df)}")
@@ -227,7 +237,8 @@ def load_aligned_data(engine):
 
 # ── Prepare Features ──────────────────────────────────────────
 def prepare_features(df):
-    """Extract and scale features for each modality."""
+    """Extract and scale features for each modality.
+    Market features now include a 3-dim one-hot regime encoding."""
     market_cols = [
         "rsi_14", "macd", "macd_signal", "macd_diff",
         "ema_20", "ema_50", "bb_upper", "bb_lower", "bb_mid",
@@ -247,6 +258,13 @@ def prepare_features(df):
     scaler = StandardScaler()
     market_data = scaler.fit_transform(market_data)
 
+    # Regime one-hot (3 extra columns) — appended to market features
+    regime_onehot = pd.get_dummies(df["regime"]).reindex(
+        columns=REGIME_ORDER, fill_value=0
+    ).values.astype(np.float32)
+
+    market_data = np.concatenate([market_data, regime_onehot], axis=1)
+
     # Sentiment features
     sentiment_data = df[["sentiment_neg", "sentiment_neu", "sentiment_pos"]].values
 
@@ -262,10 +280,11 @@ def prepare_features(df):
 
     targets = df["target"].values
 
-    logger.info(f"Market shape: {market_data.shape}")
+    logger.info(f"Market shape (incl. regime one-hot): {market_data.shape}")
     logger.info(f"Sentiment shape: {sentiment_data.shape}")
     logger.info(f"Visual shape: {visual_data.shape}")
     logger.info(f"Target distribution: {np.bincount(targets)}")
+    logger.info(f"Regime distribution:\n{df['regime'].value_counts().to_string()}")
 
     return market_data, sentiment_data, visual_data, targets, scaler
 
@@ -369,7 +388,9 @@ def run_fusion_pipeline():
             "batch_size": BATCH_SIZE,
             "epochs": EPOCHS,
             "lr": LR,
-            "dropout": DROPOUT
+            "dropout": DROPOUT,
+            "market_dim": market_data.shape[1],
+            "regime_conditioning": True
         })
 
         best_val_acc = 0
@@ -425,3 +446,4 @@ def run_fusion_pipeline():
 
 if __name__ == "__main__":
     run_fusion_pipeline()
+  
