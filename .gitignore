@@ -2,4 +2,19 @@
 data/mmis.db
 data/images/
 __pycache__/
+*.pyc.env
+data/mmis.db
+data/images/
+__pycache__/
 *.pyc
+
+# MLflow run tracking histories and tracking db
+mlruns/
+mlflow.db
+
+# Large pre-trained weights and generated HMM binaries
+models/best_fusion_model.pt
+models/hmm_*.pkl
+
+# Generated CSVs and JSON evaluation reports
+results/
