@@ -2,10 +2,6 @@
 data/mmis.db
 data/images/
 __pycache__/
-*.pyc.env
-data/mmis.db
-data/images/
-__pycache__/
 *.pyc
 
 # MLflow run tracking histories and tracking db
