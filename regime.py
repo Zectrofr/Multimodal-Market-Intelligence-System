@@ -463,30 +463,61 @@ def load_all_tickers(db_path: str) -> dict[str, pd.DataFrame]:
 def save_regimes_to_db(df: pd.DataFrame, db_path: str, ticker: str):
     """
     Write regime labels back into market_data table.
-    Adds 'regime' column if it doesn't exist, then UPSERTs.
+    Adds 'regime'/'regime_id' columns if missing, then UPDATEs by (date, ticker).
+
+    IMPORTANT: dates are stored in the DB as text *with microseconds*
+    (e.g. '2020-03-13 00:00:00.000000'), but str(timestamp) produces
+    '2020-03-13 00:00:00' — so a naive `WHERE date=str(row['date'])`
+    matches ZERO rows silently and the regime column stays NULL.
+    To be robust we resolve each row to the EXACT stored date string via a
+    normalized-date lookup, then verify the update count so a silent
+    0-row write can never happen again.
     """
     conn = sqlite3.connect(db_path)
     cur  = conn.cursor()
 
-    # Add column if missing (SQLite ALTER TABLE)
-    try:
-        cur.execute("ALTER TABLE market_data ADD COLUMN regime TEXT")
-        cur.execute("ALTER TABLE market_data ADD COLUMN regime_id INTEGER")
-        conn.commit()
-        logger.info("  Added regime columns to market_data")
-    except Exception:
-        pass  # columns already exist
-
-    # Update row by row (SQLite has no bulk UPSERT with WHERE)
-    for _, row in df.iterrows():
-        cur.execute(
-            "UPDATE market_data SET regime=?, regime_id=? WHERE date=? AND ticker=?",
-            (row["regime"], int(row["regime_id"]),
-             str(row["date"]), ticker)
-        )
+    # Add columns if missing (SQLite ALTER TABLE)
+    for col, decl in [("regime", "TEXT"), ("regime_id", "INTEGER")]:
+        try:
+            cur.execute(f"ALTER TABLE market_data ADD COLUMN {col} {decl}")
+            logger.info(f"  Added {col} column to market_data")
+        except Exception:
+            pass  # column already exists
     conn.commit()
+
+    # Map normalized date -> exact stored date string (handles any text format)
+    stored = cur.execute(
+        "SELECT date FROM market_data WHERE ticker=?", (ticker,)
+    ).fetchall()
+    date_lookup = {pd.Timestamp(d[0]).normalize(): d[0] for d in stored}
+
+    params, missing = [], 0
+    for _, row in df.iterrows():
+        stored_date = date_lookup.get(pd.Timestamp(row["date"]).normalize())
+        if stored_date is None:
+            missing += 1
+            continue
+        params.append((row["regime"], int(row["regime_id"]), stored_date, ticker))
+
+    before = conn.total_changes
+    cur.executemany(
+        "UPDATE market_data SET regime=?, regime_id=? WHERE date=? AND ticker=?",
+        params,
+    )
+    conn.commit()
+    updated = conn.total_changes - before
     conn.close()
-    logger.info(f"  Regime labels saved to DB for {ticker}")
+
+    if updated == 0:
+        logger.error(
+            f"  ⚠️  0 rows updated for {ticker} — regime column stays NULL! "
+            f"Check date matching."
+        )
+    else:
+        msg = f"  ✅ Regime labels saved to DB for {ticker}: {updated} rows updated"
+        if missing:
+            msg += f" ({missing} dates not found in DB)"
+        logger.info(msg)
 
 
 # ══════════════════════════════════════════════════════════

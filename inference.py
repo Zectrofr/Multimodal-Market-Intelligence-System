@@ -21,6 +21,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Reuse exact same feature pipeline as fusion.py — import directly
+import pickle
 from fusion import (
     CrossModalAttention,
     load_aligned_data,
@@ -31,6 +32,7 @@ from fusion import (
     FUSION_DIM,
     NUM_HEADS,
     DROPOUT,
+    SCALER_PATH,
 )
 
 logging.basicConfig(
@@ -56,6 +58,7 @@ def mc_dropout_inference(
     n_passes: int = MC_PASSES,
     batch_size: int = 256,
     device: str = "cpu",
+    temperature: float = 1.0,
 ) -> dict:
     """
     Run N stochastic forward passes with dropout ACTIVE (model.train()).
@@ -86,7 +89,7 @@ def mc_dropout_inference(
                 v_batch = visual[start:end].to(device)
 
                 logits, _, _ = model(m_batch, s_batch, v_batch)
-                proba = torch.softmax(logits, dim=-1).cpu()
+                proba = torch.softmax(logits / temperature, dim=-1).cpu()
 
                 sum_proba[start:end]    += proba
                 sum_sq_proba[start:end] += proba ** 2
@@ -112,6 +115,9 @@ def mc_dropout_inference(
 
 
 def run_inference():
+    # Seed the stochastic MC-Dropout passes so predictions are reproducible.
+    np.random.seed(42)
+    torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
@@ -120,7 +126,20 @@ def run_inference():
     # ── 1. Rebuild the exact same feature pipeline as fusion.py ──────
     logger.info("Loading & preparing features (same pipeline as fusion.py)...")
     df = load_aligned_data(engine)
-    market_data, sentiment_data, visual_data, targets, scaler = prepare_features(df)
+
+    # Load the scalers fit on the TRAIN split during fusion.py training, so
+    # inference applies the identical transform (no refitting / no leakage).
+    if not Path(SCALER_PATH).exists():
+        raise FileNotFoundError(
+            f"{SCALER_PATH} not found. Run `python fusion.py` first to fit & save scalers."
+        )
+    with open(SCALER_PATH, "rb") as f:
+        scalers = pickle.load(f)
+    temperature = float(scalers.get("temperature", 1.0))
+    logger.info(f"Calibration temperature: {temperature:.4f}")
+    market_data, sentiment_data, visual_data, targets, _, _ = prepare_features(
+        df, market_scaler=scalers["market"], visual_scaler=scalers["visual"]
+    )
 
     market_dim = market_data.shape[1]
     logger.info(f"Market dim (incl. regime one-hot): {market_dim}")
@@ -152,7 +171,7 @@ def run_inference():
     logger.info(f"Running MC Dropout: {MC_PASSES} passes over {len(df)} rows...")
     mc = mc_dropout_inference(
         model, market_t, sentiment_t, visual_t,
-        n_passes=MC_PASSES, device=device
+        n_passes=MC_PASSES, device=device, temperature=temperature
     )
 
     # ── 5. Build evaluation.py-compatible dataframe ─────────────────
@@ -167,7 +186,11 @@ def run_inference():
     out["pred_proba"]      = mc["up_proba"]
     out["pred_direction"]  = mc["pred_direction"]
     out["uncertainty"]     = mc["uncertainty"]
-    out["high_uncertainty"] = (out["uncertainty"] > UNCERTAINTY_THRESHOLD).astype(int)
+    # Flag the most-uncertain 20% by PERCENTILE — MC-Dropout variance is tiny
+    # (~1e-3), so a fixed absolute threshold flags nothing.
+    unc_cut = float(np.quantile(out["uncertainty"], 0.80))
+    out["high_uncertainty"] = (out["uncertainty"] > unc_cut).astype(int)
+    logger.info(f"High-uncertainty cutoff (80th pct): {unc_cut:.6f}")
 
     # Drop last row per ticker (no actual_return available)
     out = out.dropna(subset=["actual_return"]).reset_index(drop=True)

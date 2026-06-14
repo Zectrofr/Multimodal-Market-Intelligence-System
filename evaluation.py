@@ -173,43 +173,59 @@ def run_backtest(
     uncertainty_threshold: float = 0.02,
 ) -> BacktestResult:
     """
-    Long-only strategy:
-      - Enter long when pred_direction == 1
-      - Exit next day close
-      - Apply transaction cost + slippage on each trade
-    If use_uncertainty_filter=True (Phase 5 MC Dropout), skip trades
-    where uncertainty > threshold.
+    Equal-weight, long-only PORTFOLIO backtest.
+
+      - Each ticker is sized at 1/N of capital (N = tickers in the universe).
+      - Go long a ticker on days pred_direction == 1; otherwise hold cash (0).
+      - Transaction cost + slippage are charged only on TURNOVER (entering or
+        exiting a position), NOT every day — so Buy & Hold pays the cost once,
+        not every bar.
+      - All tickers' daily P&L is aggregated into ONE portfolio return series,
+        then compounded. (The previous version compounded every ticker-day
+        sequentially as if they were separate all-in bets — which made Buy &
+        Hold bleed the per-bar cost ~9k times and report an impossible -99%.)
+
+    If use_uncertainty_filter=True (Phase 5 MC Dropout), skip trades where
+    uncertainty > threshold.
     """
-    df = df.sort_values("date").reset_index(drop=True)
-    cost_per_trade = TRANSACTION_COST + SLIPPAGE
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    cost_per_trade = TRANSACTION_COST + SLIPPAGE   # one-way cost per turnover unit
 
-    strategy_returns = []
-    equity = [1.0]
+    # ── Build per-ticker net daily return legs ──────────────────────
+    legs = []
+    for _, g in df.groupby("ticker"):
+        g = g.sort_values("date")
 
-    for _, row in df.iterrows():
-        trade_return = 0.0
+        pos = (g["pred_direction"] == 1)
+        if use_uncertainty_filter and "uncertainty" in g.columns:
+            pos = pos & (g["uncertainty"] <= uncertainty_threshold)
+        pos = pos.astype(float)
 
-        should_trade = row["pred_direction"] == 1
-        if use_uncertainty_filter and "uncertainty" in df.columns:
-            should_trade = should_trade and (row["uncertainty"] <= uncertainty_threshold)
+        prev     = pos.shift(1).fillna(0.0)
+        turnover = (pos - prev).abs()                 # 1.0 on each enter/exit
+        gross    = pos * g["actual_return"].astype(float)
+        net      = gross - turnover * cost_per_trade
 
-        if should_trade:
-            raw_return = row["actual_return"]
-            trade_return = raw_return - cost_per_trade  # enter + exit cost
-        
-        strategy_returns.append(trade_return)
-        equity.append(equity[-1] * (1 + trade_return))
+        legs.append(pd.DataFrame({
+            "date":    g["date"].values,
+            "net":     net.values,
+            "pos":     pos.values,
+            "entries": ((pos == 1) & (prev == 0)).astype(int).values,
+        }))
 
-    returns_arr = np.array(strategy_returns)
-    equity_arr  = np.array(equity)
+    legs = pd.concat(legs, ignore_index=True)
+    n_universe = max(df["ticker"].nunique(), 1)
 
-    # Only count days we actually traded
-    traded_mask = df["pred_direction"] == 1
-    if use_uncertainty_filter and "uncertainty" in df.columns:
-        traded_mask = traded_mask & (df["uncertainty"] <= uncertainty_threshold)
+    # Equal-weight portfolio: daily return = mean of per-ticker net across the
+    # universe (held tickers contribute their net; cash positions contribute 0).
+    daily = (legs.groupby("date")["net"].sum() / n_universe).sort_index()
+    returns_arr = daily.values
+    equity_arr  = np.concatenate([[1.0], np.cumprod(1.0 + returns_arr)])
 
-    traded_returns = returns_arr[traded_mask]
-    n_trades = int(traded_mask.sum())
+    # Win/loss stats over held ticker-days (matches prior "days in market" sense)
+    traded_returns = legs.loc[legs["pos"] == 1, "net"].values
+    n_trades       = int((legs["pos"] == 1).sum())
 
     total_ret      = float(equity_arr[-1] - 1)
     n_days         = len(returns_arr)
@@ -399,12 +415,20 @@ class Evaluator:
         """
         df = self.df
 
-        # 1. Model backtest
+        # 1. Model backtest. When filtering is on, derive the threshold from the
+        #    uncertainty DISTRIBUTION (drop the most-uncertain 20%) instead of a
+        #    fixed absolute value — MC-Dropout variance is tiny (~1e-3), so any
+        #    fixed 0.02-style cutoff would filter nothing.
+        unc_thr = uncertainty_threshold
+        if use_uncertainty_filter and "uncertainty" in df.columns:
+            unc_thr = float(np.quantile(df["uncertainty"].values, 0.80))
+            print(f"   Uncertainty filter: keeping predictions with "
+                  f"variance <= {unc_thr:.6f} (lowest 80%)")
         model_bt = run_backtest(
             df,
             strategy_name=model_name,
             use_uncertainty_filter=use_uncertainty_filter,
-            uncertainty_threshold=uncertainty_threshold,
+            uncertainty_threshold=unc_thr,
         )
 
         # 2. Benchmarks
@@ -438,15 +462,21 @@ class Evaluator:
                     "total_return":   bt.total_return,
                 }
 
-        # 6. Uncertainty filter analysis (Phase 5)
+        # 6. Uncertainty filter analysis (Phase 5) — percentile-based.
+        #    Does keeping only the most-confident predictions improve results?
+        #    That's the whole point of MC-Dropout. We sweep "keep lowest-X%
+        #    uncertainty" so it's meaningful regardless of the variance scale.
         uncertainty_analysis = {}
         if "uncertainty" in df.columns:
-            for threshold in [0.005, 0.01, 0.02, 0.05]:
-                filtered = df[df["uncertainty"] <= threshold]
+            unc = df["uncertainty"].values
+            for keep_frac in [0.5, 0.7, 0.8, 0.9, 1.0]:
+                thr = float(np.quantile(unc, keep_frac))
+                filtered = df[df["uncertainty"] <= thr]
                 if len(filtered) > 10:
                     bt = run_backtest(filtered.copy(),
-                                      strategy_name=f"unc<{threshold}")
-                    uncertainty_analysis[str(threshold)] = {
+                                      strategy_name=f"keep_{int(keep_frac*100)}pct")
+                    uncertainty_analysis[f"keep_lowest_{int(keep_frac*100)}pct"] = {
+                        "threshold":       round(thr, 6),
                         "sharpe":          bt.sharpe,
                         "precision_at_up": bt.precision_at_up,
                         "n_trades":        bt.n_trades,

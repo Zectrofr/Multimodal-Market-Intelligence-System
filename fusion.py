@@ -18,19 +18,38 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sqlalchemy import create_engine
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import mlflow
 import mlflow.pytorch
+import pickle
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
 # ── Logging ──────────────────────────────────────────────────
+# force=True so our config wins even if an imported lib (mlflow) already
+# called basicConfig — otherwise INFO logs (incl. per-epoch metrics) vanish.
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    force=True,
 )
 logger = logging.getLogger(__name__)
+
+SCALER_PATH = "models/feature_scalers.pkl"
+EARLY_STOP_PATIENCE = 7
+SEED = 42
+
+
+def set_seed(seed: int = SEED):
+    """Make training reproducible. Without this, walk-forward results swing
+    materially between retrains because the signal is weak (edge ~ noise)."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 # ── Configuration ─────────────────────────────────────────────
 DB_PATH = "sqlite:///data/mmis.db"
@@ -231,39 +250,53 @@ def load_aligned_data(engine):
 
     # Drop rows without visual features
     df = df.dropna(subset=["feature_vector"])
+
+    # Sort by date so the downstream 80/20 split is a TRUE temporal split
+    # (most-recent 20% = validation). Without this the split relies on
+    # physical DB row order — which flips to per-ticker blocks after a
+    # re-ingest, silently causing lookahead leakage / single-ticker val.
+    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
     logger.info(f"Aligned rows: {len(df)}")
 
     return df
 
 # ── Prepare Features ──────────────────────────────────────────
-def prepare_features(df):
+MARKET_COLS = [
+    "rsi_14", "macd", "macd_signal", "macd_diff",
+    "ema_20", "ema_50", "bb_upper", "bb_lower", "bb_mid",
+    "bb_bandwidth", "bb_position", "atr_14",
+    "returns_1d", "returns_5d", "returns_10d", "returns_20d",
+    "volume_ratio", "volume_change_1d",
+    "body_size", "upper_shadow", "lower_shadow", "high_low_range",
+    "day_of_year_sin", "day_of_year_cos", "month_sin", "month_cos",
+    "open", "high", "low", "close", "volume"
+]
+
+
+def prepare_features(df, market_scaler=None, visual_scaler=None):
     """Extract and scale features for each modality.
-    Market features now include a 3-dim one-hot regime encoding."""
-    market_cols = [
-        "rsi_14", "macd", "macd_signal", "macd_diff",
-        "ema_20", "ema_50", "bb_upper", "bb_lower", "bb_mid",
-        "bb_bandwidth", "bb_position", "atr_14",
-        "returns_1d", "returns_5d", "returns_10d", "returns_20d",
-        "volume_ratio", "volume_change_1d",
-        "body_size", "upper_shadow", "lower_shadow", "high_low_range",
-        "day_of_year_sin", "day_of_year_cos", "month_sin", "month_cos",
-        "open", "high", "low", "close", "volume"
-    ]
+    Market features include a 3-dim one-hot regime encoding (appended AFTER
+    scaling, so the one-hot stays 0/1).
 
-    # Remove duplicates
-    market_cols = list(dict.fromkeys(market_cols))
+    Scaler handling (prevents train→val leakage):
+      - If `market_scaler`/`visual_scaler` are None, NEW scalers are fit on
+        `df` and returned (use this on the TRAIN split only).
+      - If fitted scalers are passed in, they are only applied via transform
+        (use this on the VAL split and at inference time).
+    """
+    market_cols = list(dict.fromkeys(MARKET_COLS))
 
-    # Market features
-    market_data = df[market_cols].fillna(0).values
-    scaler = StandardScaler()
-    market_data = scaler.fit_transform(market_data)
+    # Market numeric features
+    market_numeric = df[market_cols].fillna(0).values
+    if market_scaler is None:
+        market_scaler = StandardScaler().fit(market_numeric)
+    market_numeric = market_scaler.transform(market_numeric)
 
-    # Regime one-hot (3 extra columns) — appended to market features
+    # Regime one-hot (3 extra columns) — appended to market features (unscaled)
     regime_onehot = pd.get_dummies(df["regime"]).reindex(
         columns=REGIME_ORDER, fill_value=0
     ).values.astype(np.float32)
-
-    market_data = np.concatenate([market_data, regime_onehot], axis=1)
+    market_data = np.concatenate([market_numeric, regime_onehot], axis=1)
 
     # Sentiment features
     sentiment_data = df[["sentiment_neg", "sentiment_neu", "sentiment_pos"]].values
@@ -273,10 +306,9 @@ def prepare_features(df):
         np.frombuffer(row, dtype=np.float32)
         for row in df["feature_vector"]
     ])
-
-    # Normalize visual features
-    visual_scaler = StandardScaler()
-    visual_data = visual_scaler.fit_transform(visual_data)
+    if visual_scaler is None:
+        visual_scaler = StandardScaler().fit(visual_data)
+    visual_data = visual_scaler.transform(visual_data)
 
     targets = df["target"].values
 
@@ -284,9 +316,8 @@ def prepare_features(df):
     logger.info(f"Sentiment shape: {sentiment_data.shape}")
     logger.info(f"Visual shape: {visual_data.shape}")
     logger.info(f"Target distribution: {np.bincount(targets)}")
-    logger.info(f"Regime distribution:\n{df['regime'].value_counts().to_string()}")
 
-    return market_data, sentiment_data, visual_data, targets, scaler
+    return market_data, sentiment_data, visual_data, targets, market_scaler, visual_scaler
 
 # ── Train / Eval ──────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, criterion, device):
@@ -337,34 +368,85 @@ def eval_epoch(model, loader, criterion, device):
 
     return total_loss / len(loader), correct / total, all_preds, all_targets
 
+# ── Probability Calibration (temperature scaling) ─────────────
+def collect_logits(model, loader, device):
+    """Return (logits, labels) tensors over a loader — for calibration."""
+    model.eval()
+    logits_all, labels_all = [], []
+    with torch.no_grad():
+        for market, sentiment, visual, targets in loader:
+            logits, _, _ = model(market.to(device), sentiment.to(device),
+                                 visual.to(device))
+            logits_all.append(logits.cpu())
+            labels_all.append(targets)
+    return torch.cat(logits_all), torch.cat(labels_all)
+
+
+def fit_temperature(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Fit a single scalar temperature T that minimises NLL on the validation
+    logits (Guo et al. 2017). Dividing logits by T>1 softens overconfident
+    probabilities — fixes calibration (ECE) WITHOUT changing argmax/predictions.
+    """
+    T = torch.nn.Parameter(torch.ones(1))
+    nll = nn.CrossEntropyLoss()
+    opt = optim.LBFGS([T], lr=0.01, max_iter=200)
+
+    def closure():
+        opt.zero_grad()
+        loss = nll(logits / T.clamp(min=1e-3), labels)
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return float(T.detach().clamp(min=1e-3).item())
+
 # ── Main Training Pipeline ────────────────────────────────────
 def run_fusion_pipeline():
+    set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    logger.info(f"Using device: {device} | seed: {SEED}")
 
     engine = create_engine(DB_PATH)
+    Path("models").mkdir(exist_ok=True)
 
-    # Load data
+    # Load data (already sorted by date in load_aligned_data)
     df = load_aligned_data(engine)
-    market_data, sentiment_data, visual_data, targets, scaler = prepare_features(df)
 
-    # Train/val split (80/20 time-based)
-    split = int(len(targets) * 0.8)
-    train_dataset = MultimodalDataset(
-        market_data[:split], sentiment_data[:split],
-        visual_data[:split], targets[:split]
-    )
-    val_dataset = MultimodalDataset(
-        market_data[split:], sentiment_data[split:],
-        visual_data[split:], targets[split:]
+    # ── Temporal split BEFORE scaling (no train→val leakage) ────────
+    split = int(len(df) * 0.8)
+    train_df, val_df = df.iloc[:split], df.iloc[split:]
+    logger.info(
+        f"Temporal split — train: {train_df['date'].min()}..{train_df['date'].max()} "
+        f"({len(train_df)} rows) | val: {val_df['date'].min()}..{val_df['date'].max()} "
+        f"({len(val_df)} rows)"
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    # Fit scalers on TRAIN only, then transform both splits with them
+    (m_tr, s_tr, v_tr, y_tr,
+     market_scaler, visual_scaler) = prepare_features(train_df)
+    m_va, s_va, v_va, y_va, _, _ = prepare_features(
+        val_df, market_scaler=market_scaler, visual_scaler=visual_scaler
+    )
+
+    # Persist scalers so inference uses the EXACT same transform
+    with open(SCALER_PATH, "wb") as f:
+        pickle.dump({"market": market_scaler, "visual": visual_scaler}, f)
+    logger.info(f"Saved feature scalers → {SCALER_PATH}")
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_loader = DataLoader(
+        MultimodalDataset(m_tr, s_tr, v_tr, y_tr),
+        batch_size=BATCH_SIZE, shuffle=True, generator=g
+    )
+    val_loader = DataLoader(
+        MultimodalDataset(m_va, s_va, v_va, y_va), batch_size=BATCH_SIZE
+    )
 
     # Model
     model = CrossModalAttention(
-        market_dim=market_data.shape[1],
+        market_dim=m_tr.shape[1],
         sentiment_dim=SENTIMENT_DIM,
         visual_dim=VISUAL_DIM,
         fusion_dim=FUSION_DIM,
@@ -376,12 +458,20 @@ def run_fusion_pipeline():
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    criterion = nn.CrossEntropyLoss()
+
+    # Class-weighted loss — counters the UP-class imbalance that otherwise
+    # collapses the model into predicting UP ~80% of the time.
+    class_counts = np.bincount(y_tr, minlength=NUM_CLASSES).astype(float)
+    class_weights = len(y_tr) / (NUM_CLASSES * np.clip(class_counts, 1, None))
+    weight_t = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    logger.info(f"Train class counts: {class_counts.astype(int).tolist()} "
+                f"→ weights: {np.round(class_weights, 3).tolist()}")
+    criterion = nn.CrossEntropyLoss(weight=weight_t)
 
     # MLflow tracking
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name="cross_modal_attention_v1"):
+    with mlflow.start_run(run_name="cross_modal_attention_v2"):
         mlflow.log_params({
             "fusion_dim": FUSION_DIM,
             "num_heads": NUM_HEADS,
@@ -389,12 +479,19 @@ def run_fusion_pipeline():
             "epochs": EPOCHS,
             "lr": LR,
             "dropout": DROPOUT,
-            "market_dim": market_data.shape[1],
-            "regime_conditioning": True
+            "market_dim": m_tr.shape[1],
+            "regime_conditioning": True,
+            "class_weighted_loss": True,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "model_selection": "macro_f1",
+            "scaler_fit": "train_only",
         })
 
-        best_val_acc = 0
-        Path("models").mkdir(exist_ok=True)
+        # Model selection by macro-F1 (balanced across classes) — NOT raw
+        # accuracy, which rewards the degenerate all-UP predictor.
+        best_val_f1 = -1.0
+        best_epoch = 0
+        epochs_no_improve = 0
 
         for epoch in range(1, EPOCHS + 1):
             train_loss, train_acc = train_epoch(
@@ -405,44 +502,66 @@ def run_fusion_pipeline():
             )
             scheduler.step()
 
+            val_f1 = f1_score(targets_val, preds, average="macro", zero_division=0)
+
             mlflow.log_metrics({
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc
+                "train_loss": train_loss, "train_acc": train_acc,
+                "val_loss": val_loss, "val_acc": val_acc, "val_macro_f1": val_f1,
             }, step=epoch)
 
             logger.info(
                 f"Epoch {epoch:02d}/{EPOCHS} | "
                 f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-                f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}"
+                f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}"
             )
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_epoch = epoch
+                epochs_no_improve = 0
                 torch.save(model.state_dict(), "models/best_fusion_model.pt")
-                logger.info(f"  ✅ New best model saved (val_acc={val_acc:.4f})")
+                logger.info(f"  ✅ New best model saved (val_macro_f1={val_f1:.4f})")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                    logger.info(
+                        f"  ⏹  Early stop at epoch {epoch} "
+                        f"(no F1 improvement for {EARLY_STOP_PATIENCE} epochs)"
+                    )
+                    break
 
-        # Final evaluation
+        # Final evaluation on the best checkpoint
         model.load_state_dict(torch.load("models/best_fusion_model.pt"))
-        _, _, final_preds, final_targets = eval_epoch(
+        _, final_acc, final_preds, final_targets = eval_epoch(
             model, val_loader, criterion, device
         )
 
+        # Fit calibration temperature on the validation set and persist it
+        # alongside the scalers so inference produces calibrated probabilities.
+        val_logits, val_labels = collect_logits(model, val_loader, device)
+        temperature = fit_temperature(val_logits, val_labels)
+        logger.info(f"Fitted calibration temperature: {temperature:.4f}")
+        with open(SCALER_PATH, "wb") as f:
+            pickle.dump({"market": market_scaler, "visual": visual_scaler,
+                         "temperature": temperature}, f)
+        mlflow.log_metric("calibration_temperature", temperature)
+
         report = classification_report(
             final_targets, final_preds,
-            target_names=["Down", "Flat", "Up"]
+            target_names=["Down", "Flat", "Up"], zero_division=0
         )
-        logger.info(f"\nClassification Report:\n{report}")
+        logger.info(f"\nClassification Report (best epoch {best_epoch}):\n{report}")
         mlflow.log_text(report, "classification_report.txt")
-        mlflow.log_metric("best_val_acc", best_val_acc)
+        mlflow.log_metric("best_val_macro_f1", best_val_f1)
+        mlflow.log_metric("best_val_acc", final_acc)
         mlflow.pytorch.log_model(model, "fusion_model")
 
         logger.info(f"\n✅ Fusion pipeline complete")
-        logger.info(f"   Best validation accuracy: {best_val_acc:.4f}")
+        logger.info(f"   Best epoch: {best_epoch} | val macro-F1: {best_val_f1:.4f} "
+                    f"| val acc: {final_acc:.4f}")
         logger.info(f"   Model saved to: models/best_fusion_model.pt")
 
-    return model, best_val_acc
+    return model, best_val_f1
 
 if __name__ == "__main__":
     run_fusion_pipeline()
