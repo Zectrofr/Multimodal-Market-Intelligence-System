@@ -25,7 +25,7 @@ market-regime model, with uncertainty quantification.
 | 3 | **HMM market-regime** conditioning (mean-reverting / trending / high-vol), one-hot into fusion | `regime.py` |
 | 4 | Output head: 3-class direction + **MC-Dropout uncertainty** + temperature-calibrated probabilities | `fusion.py`, `inference.py` |
 | 5 | Evaluation: Sharpe / drawdown / **precision\@UP** / calibration / **walk-forward** | `evaluation.py` |
-| 6 | *(planned)* FastAPI + Streamlit live demo with Grad-CAM | — |
+| 6 | **Live demo:** on-demand inference, Grad-CAM, FastAPI + Streamlit | `live_inference.py`, `gradcam.py`, `api/main.py`, `dashboard/app.py` |
 
 Data lives in `data/mmis.db` (SQLite): `market_data`, `sentiment_data`,
 `visual_features`. Universe: AAPL, GOOGL, MSFT, TSLA, AMZN, SPY (2020–2026,
@@ -132,7 +132,36 @@ This repo previously produced *meaningless* headline numbers. Fixed:
   conclusions (there's no edge to inflate), but for a live/causal system the HMM
   must be fit rolling. Tracked for Layer 6.
 
+## Layer 6 — live demo (built)
+
+On-demand, end-to-end: enter a ticker → fetch latest OHLCV (yfinance) → indicators
+→ render chart → **live EfficientNet** visual features → **live FinBERT** on current
+headlines → **HMM regime** → cross-modal fusion → **MC-Dropout** (mean + uncertainty)
+→ **isotonic-calibrated** probability → **Grad-CAM** heatmap of the candles that drove
+the prediction. Models load once and are reused.
+
+```bash
+# 1. Start the API (loads all models once)
+uvicorn api.main:app --port 8000           # → http://localhost:8000/docs
+
+# 2. Start the dashboard (in a second terminal)
+streamlit run dashboard/app.py             # → http://localhost:8501
+
+# Or hit the API directly:
+#   GET http://localhost:8000/analyze?ticker=AAPL
+# Or run a one-off prediction / Grad-CAM from the CLI:
+python live_inference.py AAPL
+python gradcam.py AAPL
+```
+
+Every prediction surfaces its uncertainty and a "not financial advice / no
+out-of-sample edge" disclaimer — honesty is part of the product.
+
+> **Note on regime at serve time:** the HMM is pre-fit on history and applied to the
+> current window, which is causal at inference. (The *training-label* lookahead noted
+> above is a separate, documented issue and doesn't affect live serving.)
+
 ## Roadmap
-- **Layer 6 live demo:** `live_inference.py` (on-demand single ticker) → Grad-CAM on
-  the live chart → FastAPI `/predict` → Streamlit dashboard. This is the
-  highest-impact remaining work for a portfolio/interview piece.
+- Make the HMM regime labels fully causal (rolling fit) for training too.
+- Expand news coverage beyond the NewsAPI free-tier 30-day window.
+- Rolling weekly retraining.

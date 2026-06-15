@@ -23,4 +23,6 @@ mlflow==3.13.0
 # Serving / demo (Layer 6)
 fastapi==0.136.3
 uvicorn==0.49.0
-streamlit==1.40.0             # not yet installed in this env: pip install streamlit
+streamlit==1.58.0
+newsapi-python==0.2.7        # live headlines for FinBERT
+python-dotenv==1.0.1         # loads NEWS_API_KEY from .env
