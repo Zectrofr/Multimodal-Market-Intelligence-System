@@ -22,6 +22,7 @@ warnings.filterwarnings("ignore")
 
 # Reuse exact same feature pipeline as fusion.py — import directly
 import pickle
+from sklearn.isotonic import IsotonicRegression
 from fusion import (
     CrossModalAttention,
     load_aligned_data,
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 MC_PASSES = 50
 UNCERTAINTY_THRESHOLD = 0.02
 MODEL_PATH = "models/best_fusion_model.pt"
+CALIBRATOR_PATH = "models/calibrator.pkl"
 OUTPUT_CSV = "results/final_predictions.csv"
 
 # UP class index in the 3-class target (0=Down, 1=Flat, 2=Up — from ingest.py)
@@ -178,14 +180,18 @@ def run_inference():
     out = df[["date", "ticker", "close", "regime"]].copy()
     out["date"] = pd.to_datetime(out["date"])
 
-    # actual_return: next-day return, computed per-ticker (avoids
-    # cross-ticker boundary bug from the regime.py CSV)
-    out = out.sort_values(["ticker", "date"]).reset_index(drop=True)
-    out["actual_return"] = out.groupby("ticker")["close"].pct_change().shift(-1)
-
+    # CRITICAL: attach the MC-Dropout outputs while `out` is still in df order
+    # (the mc arrays are aligned to df rows). Doing this AFTER a re-sort assigns
+    # them positionally to the wrong (date,ticker) and scrambles every
+    # prediction against its actual outcome.
     out["pred_proba"]      = mc["up_proba"]
     out["pred_direction"]  = mc["pred_direction"]
     out["uncertainty"]     = mc["uncertainty"]
+
+    # Now sort by ticker,date (all columns move together) and compute the
+    # next-day return per ticker.
+    out = out.sort_values(["ticker", "date"]).reset_index(drop=True)
+    out["actual_return"] = out.groupby("ticker")["close"].pct_change().shift(-1)
     # Flag the most-uncertain 20% by PERCENTILE — MC-Dropout variance is tiny
     # (~1e-3), so a fixed absolute threshold flags nothing.
     unc_cut = float(np.quantile(out["uncertainty"], 0.80))
@@ -194,6 +200,26 @@ def run_inference():
 
     # Drop last row per ticker (no actual_return available)
     out = out.dropna(subset=["actual_return"]).reset_index(drop=True)
+
+    # ── 5b. Isotonic probability calibration ───────────────────────────
+    # The raw UP-probability is poorly calibrated (class-weighted training +
+    # temperature scaling don't fix the binary up/down calibration). Fit an
+    # isotonic map pred_proba -> P(actual up) on the TRAINING period and apply
+    # to all rows. Fitting on TRAIN (not val) keeps the validation ECE an HONEST
+    # held-out test — fitting on val would make its ECE trivially ~0. This
+    # changes only the probability, NOT pred_direction, so precision/returns
+    # are unaffected; only calibration (ECE) improves.
+    val_start = out["date"].quantile(0.80)
+    train_mask = out["date"] < val_start
+    y_up = (out["actual_return"] > 0).astype(int).values
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(out.loc[train_mask, "pred_proba"].values, y_up[train_mask])
+    out["pred_proba_uncalibrated"] = out["pred_proba"]
+    out["pred_proba"] = iso.predict(out["pred_proba"].values)
+    with open(CALIBRATOR_PATH, "wb") as f:
+        pickle.dump(iso, f)
+    logger.info(f"Isotonic calibrator fit on training (< {val_start.date()}) "
+                f"→ saved {CALIBRATOR_PATH}")
 
     # ── 6. Save ──────────────────────────────────────────────────────
     Path("results").mkdir(exist_ok=True)

@@ -61,21 +61,27 @@ Everything is reproducible (`SEED = 42` in `fusion.py`; MC-Dropout seeded in `in
 
 ## Reproducible benchmark (seed = 42)
 
-Validation = most recent ~15 months (2025-03 → 2026-06), strict temporal split.
+Strict temporal split: train ≤ 2025-03, **validation = the most recent ~15 months
+(2025-03 → 2026-06) the model never trained on.**
 
-| Metric | Model | Buy & Hold |
+> ⚠️ **Read the out-of-sample column, not the full-sample one.** A backtest over the
+> *full* history includes the ~80% of dates the model trained on and looks
+> spectacular (Sharpe ~1.9, +467%) — that is **in-sample memorisation, not skill.**
+> The honest number is the out-of-sample (validation) column.
+
+| Metric | **Out-of-sample** (honest) | Full sample (in-sample, inflated) |
 |---|---|---|
-| Total return (full sample) | −10.8% | **+373%** |
-| Sharpe | −0.10 | **1.09** |
-| Max drawdown | 32% | 42% |
-| Precision\@UP (in-sample) | 53.8% | — |
-| **Walk-forward precision\@UP (24 folds)** | **50.0%** | — |
-| Calibration (ECE) | 0.20 (poor) | — |
+| Precision\@UP | **52.8%** (base rate 53.4% → edge **−0.6 pts**) | 57.9% |
+| Sharpe | **0.95** (Buy & Hold 1.35) | 1.90 (BH 1.09) |
+| Total return | +19% (BH +46%) | +467% (BH +373%) |
+| Calibration (ECE, isotonic) | **0.020 (good)** | 0.004 |
 
-**Interpretation:** out-of-sample the model is at coin-flip and underperforms simply
-holding the basket. The only mildly interesting signal is per-regime: the model
-behaves best in the `high_vol` regime. This is the expected result for free-data
-next-day prediction and is reported honestly rather than hidden.
+**Interpretation:** out-of-sample the model has **no directional edge** (precision
+*below* the base rate) and **underperforms simply holding the basket**. This is the
+expected result for next-day prediction on free daily data, and it is now measured
+*correctly* (see bug #7 below) and reported as the headline rather than buried under
+the in-sample mirage. The value of the project is the rigorous, honest, interpretable
+engineering — not alpha.
 
 ---
 
@@ -99,17 +105,32 @@ This repo previously produced *meaningless* headline numbers. Fixed:
 5. **Degenerate UP-bias:** unweighted loss + accuracy-based model selection picked an
    all-UP predictor. Now **class-weighted** loss, **macro-F1** model selection, and
    **early stopping**.
-6. **Dead uncertainty filter / calibration:** MC-Dropout variance (~1e-3) never
-   crossed the fixed 0.02 threshold. Filter is now **percentile-based**, and
-   probabilities are **temperature-scaled** (calibration still poor — a known limit).
+6. **Dead uncertainty filter:** MC-Dropout variance (~1e-3) never crossed the fixed
+   0.02 threshold. Now **percentile-based**.
+7. **🔴 Prediction–row misalignment (the big one).** `inference.py` assigned the
+   MC-Dropout outputs to the prediction frame *after* re-sorting it by
+   `["ticker","date"]`, while the arrays were in `["date","ticker"]` order — so
+   **100% of predictions were attached to the wrong (date, ticker)** and every
+   evaluation metric was computed on scrambled predictions (≈coin-flip by
+   construction). Fixed by attaching outputs *before* the re-sort. This is what
+   flipped the result from "looks like no signal at all" to "clear in-sample fit,
+   honest out-of-sample ≈ coin-flip".
+8. **Calibration:** probabilities are now **isotonic-calibrated** (fit on the
+   training period, so the validation ECE is an honest held-out test). OOS ECE
+   improved from ~0.20 → **0.020**. (Temperature scaling is also fit during
+   training but isotonic does the heavy lifting for the binary up/down metric.)
+9. **Reproducibility:** `SEED=42` (override via `MMIS_SEED` env var), seeded
+   MC-Dropout, and a `scripts/robustness_sweep.py` that re-runs across seeds to
+   separate signal from noise.
 
 ## Known limitations
-- **No out-of-sample edge** (by design — free data).
+- **No out-of-sample edge** (by design — free daily data).
 - **Sentiment coverage ~1.3%** (124 / 9,412 rows): NewsAPI free tier is 30-day
   limited, so the FinBERT modality is neutral for ~99% of history.
-- **Calibration remains poor** (ECE ~0.20): the class-weighted model's UP-probability
-  is systematically low; temperature scaling on 3-class logits doesn't fully fix the
-  binary up/down calibration.
+- **Regime-label lookahead:** `regime.py` fits the HMM on each ticker's *full*
+  history, so the regime label at day *t* peeks at the future. Harmless to current
+  conclusions (there's no edge to inflate), but for a live/causal system the HMM
+  must be fit rolling. Tracked for Layer 6.
 
 ## Roadmap
 - **Layer 6 live demo:** `live_inference.py` (on-demand single ticker) → Grad-CAM on

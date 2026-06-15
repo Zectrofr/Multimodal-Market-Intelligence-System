@@ -408,10 +408,17 @@ class Evaluator:
         use_uncertainty_filter: bool = False,
         uncertainty_threshold: float = 0.02,
         run_walk_forward: bool = True,
+        val_start: str = None,
     ) -> dict:
         """
         Returns a full evaluation report as a dict.
-        Includes: model backtest, benchmarks, calibration, walk-forward.
+        Includes: model backtest, benchmarks, calibration, walk-forward, AND a
+        dedicated OUT-OF-SAMPLE block (the only honest headline — the full-sample
+        backtest includes the ~80% the model trained on, which inflates it).
+
+        `val_start`: ISO date marking the start of the validation period the model
+        never trained on. If None, it is auto-set to the 80th-percentile date so it
+        matches fusion.py's temporal split.
         """
         df = self.df
 
@@ -489,6 +496,34 @@ class Evaluator:
             folds = walk_forward_split(df)
             wf_folds = [asdict(f) for f in folds]
 
+        # 8. OUT-OF-SAMPLE block — the honest headline. The full-sample backtest
+        #    above includes the ~80% of dates the model trained on (in-sample),
+        #    which massively inflates returns/precision. Here we isolate the
+        #    validation period the model never saw.
+        if val_start is None:
+            val_start = str(df["date"].quantile(0.80).date())
+        oos = df[df["date"] >= pd.to_datetime(val_start)].copy()
+        out_of_sample = {"val_start": val_start, "n_predictions": int(len(oos))}
+        if len(oos) > 20:
+            oos_bt = run_backtest(oos, strategy_name="OOS",
+                                  use_uncertainty_filter=use_uncertainty_filter,
+                                  uncertainty_threshold=uncertainty_threshold)
+            oos_bh = benchmark_buy_and_hold(oos)
+            oos_base_up = float((oos["actual_return"] > 0).mean())
+            oos_ece, _ = expected_calibration_error(
+                oos["pred_proba"].values,
+                (oos["actual_return"] > 0).astype(int).values)
+            out_of_sample.update({
+                "precision_at_up":   oos_bt.precision_at_up,
+                "base_up_rate":      round(oos_base_up, 4),
+                "precision_edge_pts": round((oos_bt.precision_at_up - oos_base_up) * 100, 2),
+                "sharpe":            oos_bt.sharpe,
+                "buy_hold_sharpe":   oos_bh.sharpe,
+                "total_return":      oos_bt.total_return,
+                "buy_hold_return":   oos_bh.total_return,
+                "ece":               round(oos_ece, 5),
+            })
+
         # Build final report
         def _bt_to_dict(bt: BacktestResult) -> dict:
             d = asdict(bt)
@@ -532,6 +567,7 @@ class Evaluator:
                 "sharpe_vs_random":    round(model_bt.sharpe - rnd_bt.sharpe, 4),
                 "return_vs_bh":        round(model_bt.total_return - bh_bt.total_return, 4),
             },
+            "out_of_sample": out_of_sample,
         }
 
         return report
@@ -573,7 +609,17 @@ class Evaluator:
         print(f"  {report['n_predictions']} predictions | {report['n_tickers']} tickers")
         print(f"{'═'*55}")
 
-        print(f"\n📈  RETURNS")
+        oos = report.get("out_of_sample", {})
+        if oos.get("n_predictions", 0) > 20:
+            print(f"\n🧪  OUT-OF-SAMPLE  (validation only, from {oos['val_start']}) ← THE HONEST HEADLINE")
+            print(f"  Precision@UP   : {oos['precision_at_up']:>6.2%}  (base up-rate {oos['base_up_rate']:>6.2%}"
+                  f" → edge {oos['precision_edge_pts']:>+.2f} pts)")
+            print(f"  Sharpe         : {oos['sharpe']:>6.3f}  (BH: {oos['buy_hold_sharpe']:>6.3f})")
+            print(f"  Total Return   : {oos['total_return']:>+.2%}  (BH: {oos['buy_hold_return']:>+.2%})")
+            print(f"  ECE            : {oos['ece']:.5f}")
+            print(f"  NOTE: the FULL-SAMPLE figures below include ~80% in-sample data and are inflated.")
+
+        print(f"\n📈  RETURNS  (full sample — includes in-sample, inflated)")
         print(f"  Total Return     : {m['total_return']:>+.2%}  (BH: {bh['total_return']:>+.2%})")
         print(f"  Annualised Return: {m['annualised_return']:>+.2%}  (BH: {bh['annualised_return']:>+.2%})")
 

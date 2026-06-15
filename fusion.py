@@ -10,6 +10,7 @@ and concatenated into the market feature vector.
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -38,7 +39,8 @@ logger = logging.getLogger(__name__)
 
 SCALER_PATH = "models/feature_scalers.pkl"
 EARLY_STOP_PATIENCE = 7
-SEED = 42
+# Default seed 42; override with MMIS_SEED env var for robustness sweeps.
+SEED = int(os.environ.get("MMIS_SEED", "42"))
 
 
 def set_seed(seed: int = SEED):
