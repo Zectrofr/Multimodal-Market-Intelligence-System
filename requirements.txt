@@ -27,3 +27,6 @@ uvicorn==0.49.0
 streamlit==1.58.0
 newsapi-python==0.2.7        # live headlines for FinBERT
 python-dotenv==1.0.1         # loads NEWS_API_KEY from .env
+
+# Tests
+pytest==9.1.1                # characterization suite in tests/ — see tests/README.md
