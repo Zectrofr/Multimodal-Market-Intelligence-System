@@ -18,6 +18,7 @@ import torchvision.transforms as transforms
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from PIL import Image
 from tqdm import tqdm
+from db_guard import assert_safe_to_replace
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -119,6 +120,20 @@ def extract_features(image_path: Path, model, transform) -> np.ndarray:
 
 # ── Main Vision Pipeline ──────────────────────────────────────
 def run_vision_pipeline():
+    # ── Fail-closed guard, FIRST statement in the pipeline (see docs/STATE_REPORT.md).
+    # The write at the end of this function DROPs and recreates visual_features, so the
+    # refusal must happen before EfficientNet-B0 is loaded and before any chart is rendered.
+    assert_safe_to_replace(
+        "visual_features",
+        db_path="data/mmis.db",
+        human_reason=(
+            "Regenerating those ~9,292 EfficientNet-B0 feature vectors means re-rendering "
+            "charts and running a full CPU-only forward pass over every one of them "
+            "(torch 2.12.0+cpu, cuda unavailable) — expensive, on the order of an hour, "
+            "but NOT irreversible."
+        ),
+    )
+
     engine = create_engine(DB_PATH)
     model = load_efficientnet()
     transform = get_transform()
@@ -170,23 +185,6 @@ def run_vision_pipeline():
 
     # Save to DB
     visual_df = pd.DataFrame(results)
-
-    # ── Fail-closed guard (see docs/STATE_REPORT.md): the write below DROPs and
-    # recreates visual_features. Regenerating is expensive but NOT irreversible.
-    import sqlite3 as _sqlite3
-    try:
-        _con = _sqlite3.connect("file:data/mmis.db?mode=ro", uri=True)
-        _existing = _con.execute("SELECT COUNT(*) FROM visual_features").fetchone()[0]
-        _con.close()
-    except _sqlite3.Error:
-        _existing = 0
-    if _existing > 0 and os.environ.get("MMIS_ALLOW_DESTRUCTIVE") != "1":
-        raise RuntimeError(
-            f"REFUSING TO RUN: would DROP visual_features, destroying {_existing} rows. "
-            "Regenerating these EfficientNet vectors is expensive on this CPU-only build "
-            "(torch 2.12.0+cpu, cuda unavailable) but is NOT irreversible. "
-            "Set MMIS_ALLOW_DESTRUCTIVE=1 to override."
-        )
 
     visual_df.to_sql("visual_features", con=engine, if_exists="replace", index=False)
 

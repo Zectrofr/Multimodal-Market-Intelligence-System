@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 from newsapi import NewsApiClient
 from dotenv import load_dotenv
+from db_guard import assert_safe_to_replace
 
 load_dotenv()
 
@@ -96,6 +97,19 @@ def fetch_headlines(ticker: str, date: str, client: NewsApiClient) -> list:
 
 # ── Build Sentiment Table ─────────────────────────────────────
 def run_sentiment_pipeline():
+    # ── Fail-closed guard, FIRST statement in the pipeline (see docs/STATE_REPORT.md D8).
+    # The write at the end of this function DROPs and recreates sentiment_data, so the
+    # refusal must happen before any NewsAPI quota is spent and before FinBERT is loaded.
+    assert_safe_to_replace(
+        "sentiment_data",
+        db_path="data/mmis.db",
+        human_reason=(
+            "Those rows span 2026-05-12 to 2026-06-10 and came from a NewsAPI free tier "
+            "that serves only a ~30-day window, so they can NEVER be re-fetched from "
+            "today's date. The loss is PERMANENT and data/mmis.db is gitignored."
+        ),
+    )
+
     engine = create_engine(DB_PATH)
     tokenizer, model = load_finbert()
     client = NewsApiClient(api_key=NEWS_API_KEY)
@@ -149,23 +163,6 @@ def run_sentiment_pipeline():
         time.sleep(0.2)  # Rate limiting
 
     sentiment_df = pd.DataFrame(results)
-
-    # ── Fail-closed guard (see docs/STATE_REPORT.md D8): the write below DROPs
-    # and recreates sentiment_data. Its 2026-05-12..2026-06-10 rows came from a
-    # NewsAPI free tier serving only ~30 days and can never be re-fetched.
-    import sqlite3 as _sqlite3
-    try:
-        _con = _sqlite3.connect("file:data/mmis.db?mode=ro", uri=True)
-        _existing = _con.execute("SELECT COUNT(*) FROM sentiment_data").fetchone()[0]
-        _con.close()
-    except _sqlite3.Error:
-        _existing = 0
-    if _existing > 0 and os.environ.get("MMIS_ALLOW_DESTRUCTIVE") != "1":
-        raise RuntimeError(
-            f"REFUSING TO RUN: would DROP sentiment_data, destroying {_existing} rows spanning "
-            "2026-05-12 to 2026-06-10. That NewsAPI free-tier window can no longer be re-fetched, "
-            "so the loss is PERMANENT. Set MMIS_ALLOW_DESTRUCTIVE=1 to override."
-        )
 
     sentiment_df.to_sql("sentiment_data", con=engine, if_exists="replace", index=False)
 

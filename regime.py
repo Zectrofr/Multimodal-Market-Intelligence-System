@@ -786,9 +786,16 @@ def run_demo():
     df_labelled["high_uncertainty"] = mc["high_uncertainty"].astype(int)
 
     Path("results").mkdir(exist_ok=True)
-    out_path = "results/demo_regime_output.csv"
+    out_path = "results/SYNTHETIC_DO_NOT_EVALUATE_demo_regime_output.csv"
+    df_labelled.insert(0, "IS_SYNTHETIC", 1)
     df_labelled.to_csv(out_path, index=False)
-    logger.info(f"\n✅ Demo output saved → {out_path}")
+    logger.warning(
+        f"\n⚠️  SYNTHETIC placeholder output written → {out_path}\n"
+        f"   Both the prices and the predictions in this file are FABRICATED: the OHLCV "
+        f"is random-number output and the probabilities come from the hand-written "
+        f"demo_model formula, NOT from any trained model.\n"
+        f"   This is NOT a result. Never pass it to evaluation.py and never quote it."
+    )
     logger.info(f"   Columns: {list(df_labelled.columns)}")
 
     _print_uncertainty_summary(df_labelled)
