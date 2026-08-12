@@ -9,6 +9,7 @@ matplotlib==3.10.9
 SQLAlchemy==2.0.50
 requests==2.34.2
 pillow==12.2.0
+tqdm==4.68.2                  # progress bars, imported by vision.py
 
 # Models
 torch==2.12.0

@@ -1,167 +1,206 @@
-# Multimodal Market Intelligence System (MMIS)
+# MMIS — Multimodal Market Intelligence System
 
-An end-to-end, **interpretable** deep-learning pipeline that predicts next-day stock
-direction by fusing three modalities — price/technical indicators, news sentiment,
-and candlestick **chart images** — via cross-modal attention, conditioned on a
-market-regime model, with uncertainty quantification.
+A research platform for forecasting **forward realized volatility** — classifying the coming
+window as calm, normal, or turbulent — with calibrated uncertainty, and for measuring **which
+information modalities earn their place in that forecast, under which market regimes**. The
+system fuses three sources: price/technical indicators, news sentiment, and candlestick chart
+images, combined through cross-modal attention and conditioned on a market-regime model.
 
-> ⚠️ **Honest scope.** This is an **engineering / interpretability artifact**, not a
-> profitable trading system. Built on *free* daily data (yfinance OHLCV, NewsAPI
-> headlines), next-day direction is near-random out-of-sample. In the reproducible
-> benchmark below the model's **walk-forward precision is ~50% (coin-flip)** and it
-> **does not beat buy-and-hold**. The value is the correct, reproducible, multimodal
-> MLOps stack and the explainability — *not* alpha. **Not financial advice.**
+This is not a trading system, not financial advice, and no capital is deployed against it. The
+object of study is the forecast and the attribution, not a strategy.
+
+---
+
+## Research questions
+
+All four are open. None is answered by the current state of this repository.
+
+- **RQ1** — Does news sentiment carry information about forward volatility beyond what price
+  and technical indicators already contain?
+- **RQ2** — Do candlestick chart images carry information beyond the numeric technical
+  indicators computed from the same bars?
+- **RQ3** — Does the relative importance of each modality shift across market regimes?
+- **RQ4** — Can the model's probability calibration be repaired, and once repaired, is its
+  stated confidence actually meaningful?
+
+Answering any of these requires an ablation harness and a clean baseline run, neither of which
+exists yet. See the roadmap.
 
 ---
 
 ## Architecture
 
-| Layer | Component | File |
-|-------|-----------|------|
-| 0 | Data ingestion: OHLCV + technical indicators + 224×224 candlestick charts | `ingest.py` |
-| 1a | News sentiment (FinBERT) → 3-dim sentiment vector | `sentiment.py` |
-| 1b | Chart images → EfficientNet-B0 → 1280-dim visual features | `vision.py` |
-| 2 | **Cross-modal attention fusion** (market query attends to sentiment+visual) | `fusion.py` |
-| 3 | **HMM market-regime** conditioning (mean-reverting / trending / high-vol), one-hot into fusion | `regime.py` |
-| 4 | Output head: 3-class direction + **MC-Dropout uncertainty** + temperature-calibrated probabilities | `fusion.py`, `inference.py` |
-| 5 | Evaluation: Sharpe / drawdown / **precision\@UP** / calibration / **walk-forward** | `evaluation.py` |
-| 6 | **Live demo:** on-demand inference, Grad-CAM, FastAPI + Streamlit | `live_inference.py`, `gradcam.py`, `api/main.py`, `dashboard/app.py` |
+### Pipeline modules
 
-Data lives in `data/mmis.db` (SQLite): `market_data`, `sentiment_data`,
-`visual_features`. Universe: AAPL, GOOGL, MSFT, TSLA, AMZN, SPY (2020–2026,
-~9,300 aligned rows).
+| Order | Module | Role |
+|---|---|---|
+| 1 | `ingest.py` | Fetches OHLCV from yfinance, computes technical indicators, renders candlestick chart PNGs, writes `market_data`. |
+| 2 | `sentiment.py` | Scores news headlines with FinBERT, writes `sentiment_data`. |
+| 3 | `vision.py` | Encodes chart images with EfficientNet-B0 into 1280-dim float32 vectors, writes `visual_features`. |
+| 4 | `regime.py` | Fits a per-ticker Gaussian HMM, writes the `regime` and `regime_id` columns back into `market_data`. |
+| 5 | `fusion.py` | Trains the cross-modal attention model; persists the checkpoint, feature scalers, and temperature. |
+| 6 | `inference.py` | Runs MC-Dropout passes, fits an isotonic calibrator, writes `results/final_predictions.csv`. |
+| 7 | `evaluation.py` | Computes backtest, calibration, and breakdown metrics from a predictions CSV. |
+
+### Auxiliary modules
+
+| Module | Role |
+|---|---|
+| `live_inference.py` | On-demand single-ticker inference from saved artifacts. |
+| `gradcam.py` | Grad-CAM attribution over the vision backbone. |
+| `api/main.py` | FastAPI service wrapping live inference. |
+| `dashboard/app.py` | Streamlit UI over the API. |
+| `scripts/robustness_sweep.py` | Re-runs the train/infer/evaluate chain across seeds. |
+
+### Ordering constraints
+
+The documented order is `ingest → sentiment → vision → regime → fusion → inference → evaluation`.
+Two things are worth knowing about it:
+
+- **`regime.py` must run before `fusion.py`.** `fusion.py` selects the `regime` column; if it is
+  unpopulated, every row silently falls back to a constant value and the regime signal is lost
+  without an error.
+- **`sentiment.py` and `vision.py` are mutually independent.** They write disjoint tables and both
+  only read `market_data`, so their relative order does not matter. The documented sequence
+  over-constrains them.
+
+---
+
+## Current status
+
+The pipeline runs end to end and produces artifacts. Beyond that, treat claims about this
+repository with suspicion — including its own past ones.
+
+The project is **mid-pivot** from next-day price direction to forward realized volatility. The
+code currently in the tree still implements the direction target; the volatility target is not
+yet built.
+
+A full read-only audit was performed and is recorded in **[`docs/STATE_REPORT.md`](docs/STATE_REPORT.md)**.
+It covers repository state, database contents, module behaviour, and defect verification, with
+every claim cited to a file and line. Its findings:
+
+- Three previously documented defects were confirmed **already repaired** in commit `37682cc`
+  (the non-temporal train/val split, scaler leakage, and the silent zero-row regime UPDATE).
+- Five previously documented defects were confirmed **outstanding**.
+- Sixteen further defects were found that had not been documented at all.
+
+**No performance numbers appear in this README.** The audit established that no headline metric
+previously published here can be traced to a single reproducible run: figures came from different
+pipeline generations, some appear in no artifact at all, and the walk-forward numbers derive from
+a loop that emits the same fold repeatedly. Those numbers have been removed rather than restated
+or caveated. Results will be published when a clean, reproducible baseline run exists — and not
+before.
+
+Prior synthetic output — generated by a numpy placeholder, not by any trained model — is
+quarantined under `results/QUARANTINE_SYNTHETIC/`. `results/README_PROVENANCE.md` indexes what in
+that directory is real, what is stale, and why the log filenames carry no ordering guarantee.
+
+---
+
+## Known defects
+
+Full detail, evidence, and severity for every item is in
+[`docs/STATE_REPORT.md` §5](docs/STATE_REPORT.md). These are findings from a deliberate audit of
+our own system, not a list of apologies. The highest-severity open items:
+
+| ID | Defect |
+|---|---|
+| **U4** | The regime feature carries look-ahead bias. The HMM is standardised on full-sample statistics and decoded with Viterbi over the entire sequence, so a training row's regime label is conditioned on observations after its own date. |
+| **U1** | `regime` and `regime_id` are mutually inconsistent. `regime_id` stores the raw HMM state index, which is arbitrary and re-permuted per ticker, while `regime` stores a volatility-sorted name. Any analysis keyed on `regime_id` silently merges different regimes across tickers. |
+| **U11** | `pred_direction` is not derivable from `pred_proba` — they agree on only 37.06% of rows. Returns are driven by the former while calibration is measured on the latter, so the calibration figure does not describe the traded signal. |
+| **U2** | FinBERT label order is inverted. The code assumes `[negative, neutral, positive]`; the model card declares `{0: positive, 1: negative, 2: neutral}`. All three sentiment probability columns are mislabelled. |
+| **U12** | The regime layer is dead at serve time. The HMM pickles cannot be unpickled under the API process, and every served prediction silently falls back to a constant regime. |
+| **D8** | Sentiment coverage is 1.3% of rows. The NewsAPI free tier returns roughly 30 days, against a dataset spanning several years. |
+| **D3** | `regime.py` could export fabricated placeholder predictions and instructed the operator to evaluate them. Now gated behind an explicit opt-in flag and written under a `SYNTHETIC_DO_NOT_EVALUATE_` filename. |
+| **D7** | The walk-forward loop never advances its training window, so every fold is identical. |
 
 ---
 
 ## Setup
 
-```bash
+Python 3.10.
+
+```powershell
 pip install -r requirements.txt
-# Create .env with:  NEWS_API_KEY=<your key>
 ```
 
-> **Windows note:** scripts print Unicode (✅, box chars). Run with
-> `PYTHONIOENCODING=utf-8 PYTHONUTF8=1` to avoid `UnicodeEncodeError` on cp1252 consoles.
+Create a `.env` file in the project root defining one key, **`NEWS_API_KEY`** (name only — never
+commit a value; `.env` is gitignored).
 
-## Run the pipeline (in order)
+On Windows consoles, set `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` to avoid `UnicodeEncodeError`
+on cp1252 terminals.
 
-```bash
-python ingest.py                              # 1. fetch data, indicators, charts → DB
-python sentiment.py                           # 2. FinBERT sentiment → DB
-python vision.py                              # 3. EfficientNet visual features → DB
-python regime.py --db data/mmis.db --all      # 4. HMM regimes → DB (writes `regime` column)
-python fusion.py                              # 5. train cross-modal fusion model (seeded)
-python inference.py                           # 6. MC-Dropout predictions → results/final_predictions.csv
-python evaluation.py --csv results/final_predictions.csv --uncertainty-filter
+### Destructive-run guards
+
+`sentiment.py` and `vision.py` both write with `if_exists="replace"`, which **drops and recreates**
+their target table. Both now refuse to run against a populated table unless you explicitly opt in:
+
+```powershell
+$env:MMIS_ALLOW_DESTRUCTIVE = "1"
 ```
 
-Everything is reproducible (`SEED = 42` in `fusion.py`; MC-Dropout seeded in `inference.py`).
+Without that variable set to exactly `1`, either module raises rather than destroying existing rows.
+
+This matters most for **sentiment data, which is irreplaceable**. Those rows came from the NewsAPI
+free tier, which serves only a rolling window of roughly the last 30 days — a window that has since
+passed. No re-run, key, or quota reset brings them back; one accidental execution destroys them
+permanently. Visual features are also replaced on re-run, but are regenerable.
+
+Verify the guards are armed at any time with `python scripts\verify_guards.py`.
+
+### Run the pipeline
+
+```powershell
+python ingest.py
+python sentiment.py
+python vision.py
+python regime.py --db data\mmis.db --all
+python fusion.py
+python inference.py
+python evaluation.py --csv results\final_predictions.csv
+```
+
+`regime.py --demo-dummy` additionally emits synthetic placeholder predictions. That output is
+fabricated by a hand-written formula, not by any model. It is not a result and must never be
+passed to `evaluation.py`.
 
 ---
 
-## Reproducible benchmark (seed = 42)
+## Data
 
-Strict temporal split: train ≤ 2025-03, **validation = the most recent ~15 months
-(2025-03 → 2026-06) the model never trained on.**
+- **Universe:** AAPL, GOOGL, MSFT, TSLA, AMZN, SPY.
+- **Span:** 2020-03-13 to 2026-06-10, daily bars.
+- **Store:** SQLite at `data/mmis.db` — tables `market_data`, `sentiment_data`, `visual_features`.
 
-> ⚠️ **Read the out-of-sample column, not the full-sample one.** A backtest over the
-> *full* history includes the ~80% of dates the model trained on and looks
-> spectacular (Sharpe ~1.9, +467%) — that is **in-sample memorisation, not skill.**
-> The honest number is the out-of-sample (validation) column.
-
-| Metric | **Out-of-sample** (honest) | Full sample (in-sample, inflated) |
-|---|---|---|
-| Precision\@UP | **52.8%** (base rate 53.4% → edge **−0.6 pts**) | 57.9% |
-| Sharpe | **0.95** (Buy & Hold 1.35) | 1.90 (BH 1.09) |
-| Total return | +19% (BH +46%) | +467% (BH +373%) |
-| Calibration (ECE, isotonic) | **0.020 (good)** | 0.004 |
-
-**Interpretation:** out-of-sample the model has **no directional edge** (precision
-*below* the base rate) and **underperforms simply holding the basket**. This is the
-expected result for next-day prediction on free daily data, and it is now measured
-*correctly* (see bug #7 below) and reported as the headline rather than buried under
-the in-sample mirage. The value of the project is the rigorous, honest, interpretable
-engineering — not alpha.
+`data/`, `models/`, `results/`, `mlruns/`, `mlflow.db`, and `data/images/` are all gitignored. **A
+fresh clone reproduces the code only, not the artifacts** — no database, no checkpoints, no
+predictions, no experiment history. Nothing backing any past claim is version-controlled.
 
 ---
-
-## Engineering correctness (bugs found & fixed)
-
-This repo previously produced *meaningless* headline numbers. Fixed:
-
-1. **Regime layer was 100% dead.** `save_regimes_to_db` matched dates as
-   `'…00:00:00'` while the DB stored `'…00:00:00.000000'`, so every `UPDATE` hit
-   **0 rows** silently — the `regime` column was all-NULL and `fusion.py` filled it
-   with a constant `"trending"`. Now writes by exact stored-date string and verifies
-   the row count.
-2. **Train/val split was temporal only by accident** (relied on physical DB row
-   order, no `ORDER BY`). Now an explicit `sort_values(["date","ticker"])`.
-3. **Evaluation return engine was broken** — it compounded all 6 tickers' daily rows
-   sequentially as separate all-in bets and charged transaction cost *every bar even
-   for Buy & Hold*, reporting an impossible **−99.7%** B&H. Rewritten as a proper
-   equal-weight **portfolio** backtest with **turnover-based** costs (B&H now +373%).
-4. **Train→val leakage:** `StandardScaler` was fit on the full dataset. Now fit on
-   **train only**, persisted (`models/feature_scalers.pkl`), and reused at inference.
-5. **Degenerate UP-bias:** unweighted loss + accuracy-based model selection picked an
-   all-UP predictor. Now **class-weighted** loss, **macro-F1** model selection, and
-   **early stopping**.
-6. **Dead uncertainty filter:** MC-Dropout variance (~1e-3) never crossed the fixed
-   0.02 threshold. Now **percentile-based**.
-7. **🔴 Prediction–row misalignment (the big one).** `inference.py` assigned the
-   MC-Dropout outputs to the prediction frame *after* re-sorting it by
-   `["ticker","date"]`, while the arrays were in `["date","ticker"]` order — so
-   **100% of predictions were attached to the wrong (date, ticker)** and every
-   evaluation metric was computed on scrambled predictions (≈coin-flip by
-   construction). Fixed by attaching outputs *before* the re-sort. This is what
-   flipped the result from "looks like no signal at all" to "clear in-sample fit,
-   honest out-of-sample ≈ coin-flip".
-8. **Calibration:** probabilities are now **isotonic-calibrated** (fit on the
-   training period, so the validation ECE is an honest held-out test). OOS ECE
-   improved from ~0.20 → **0.020**. (Temperature scaling is also fit during
-   training but isotonic does the heavy lifting for the binary up/down metric.)
-9. **Reproducibility:** `SEED=42` (override via `MMIS_SEED` env var), seeded
-   MC-Dropout, and a `scripts/robustness_sweep.py` that re-runs across seeds to
-   separate signal from noise.
-
-## Known limitations
-- **No out-of-sample edge** (by design — free daily data).
-- **Sentiment coverage ~1.3%** (124 / 9,412 rows): NewsAPI free tier is 30-day
-  limited, so the FinBERT modality is neutral for ~99% of history.
-- **Regime-label lookahead:** `regime.py` fits the HMM on each ticker's *full*
-  history, so the regime label at day *t* peeks at the future. Harmless to current
-  conclusions (there's no edge to inflate), but for a live/causal system the HMM
-  must be fit rolling. Tracked for Layer 6.
-
-## Layer 6 — live demo (built)
-
-On-demand, end-to-end: enter a ticker → fetch latest OHLCV (yfinance) → indicators
-→ render chart → **live EfficientNet** visual features → **live FinBERT** on current
-headlines → **HMM regime** → cross-modal fusion → **MC-Dropout** (mean + uncertainty)
-→ **isotonic-calibrated** probability → **Grad-CAM** heatmap of the candles that drove
-the prediction. Models load once and are reused.
-
-```bash
-# 1. Start the API (loads all models once)
-uvicorn api.main:app --port 8000           # → http://localhost:8000/docs
-
-# 2. Start the dashboard (in a second terminal)
-streamlit run dashboard/app.py             # → http://localhost:8501
-
-# Or hit the API directly:
-#   GET http://localhost:8000/analyze?ticker=AAPL
-# Or run a one-off prediction / Grad-CAM from the CLI:
-python live_inference.py AAPL
-python gradcam.py AAPL
-```
-
-Every prediction surfaces its uncertainty and a "not financial advice / no
-out-of-sample edge" disclaimer — honesty is part of the product.
-
-> **Note on regime at serve time:** the HMM is pre-fit on history and applied to the
-> current window, which is causal at inference. (The *training-label* lookahead noted
-> above is a separate, documented issue and doesn't affect live serving.)
 
 ## Roadmap
-- Make the HMM regime labels fully causal (rolling fit) for training too.
-- Expand news coverage beyond the NewsAPI free-tier 30-day window.
-- Rolling weekly retraining.
+
+Dependency-ordered. Each step is blocked by the one above it.
+
+1. **Correctness fixes**, regime look-ahead (U4) first. Every downstream measurement inherits it,
+   so nothing measured before it is fixed can be trusted.
+2. **Characterization tests.** The repository currently has none — no test files, no CI. Every fix
+   above is otherwise unguarded against regression.
+3. **Target migration** from next-day direction to forward realized volatility, with explicit
+   calm/normal/turbulent thresholds.
+4. **Classical baselines** — HAR-RV and GARCH(1,1). These become the benchmark any multimodal
+   result must beat. A deep model that does not beat HAR-RV on volatility has not earned its
+   complexity.
+5. **Sentiment data source replacement**, to obtain history rather than a rolling 30-day window.
+6. **Ablation harness** to address RQ1–RQ3. This is **gated behind step 5**: running ablations at
+   1.3% sentiment coverage measures whether a near-constant vector helps, not whether sentiment
+   helps. The answer would be meaningless.
+7. **Explainability dashboard**, once there is a trustworthy model to explain.
+
+---
+
+## Disclaimer
+
+This is a research project. It is **not financial advice**, not a recommendation to trade, and not
+suitable for live trading. No capital is deployed against it. All outputs carry uncertainty, and
+the defects listed above are unresolved. Do not make financial decisions using this software.
