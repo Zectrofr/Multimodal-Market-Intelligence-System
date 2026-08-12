@@ -14,3 +14,5 @@ models/*.pkl
 
 # Generated CSVs and JSON evaluation reports
 results/
+# Local artifact baselines (never commit)
+backups/

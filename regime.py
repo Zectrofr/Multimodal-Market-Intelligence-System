@@ -568,6 +568,7 @@ def run_regime_pipeline(
     save_to_db_flag:bool = True,
     export_csv:     bool = True,
     output_dir:     str  = "results",
+    demo_dummy:     bool = False,
 ) -> dict:
     """
     Full Phase 5 pipeline:
@@ -607,37 +608,39 @@ def run_regime_pipeline(
         stats = hmm.regime_stats(df_labelled)
         _print_regime_stats(tkr, stats)
 
-        # 4. MC Dropout uncertainty (numpy simulation on 1d returns)
-        #    In production, replace pred_proba_fn with your actual fusion model
-        def dummy_model(x_dropped: np.ndarray) -> np.ndarray:
-            """
-            Placeholder model: replace with real model.predict_proba() in Phase 4+.
-            For now simulates a slight directional edge using log returns.
-            """
-            n    = x_dropped.shape[0]
-            # Use first feature (log return) as weak signal
-            ret  = x_dropped[:, 0] if x_dropped.shape[1] > 0 else np.zeros(n)
-            # Build 3-class softmax: [down, flat, up]
-            up   = np.clip(0.35 + ret * 5, 0.05, 0.85)
-            down = np.clip(0.35 - ret * 5, 0.05, 0.85)
-            flat = np.clip(1.0 - up - down, 0.05, 0.90)
-            proba = np.column_stack([down, flat, up])
-            proba = proba / proba.sum(axis=1, keepdims=True)
-            return proba
+        # 4. MC Dropout uncertainty — SYNTHETIC placeholder, opt-in only.
+        #    Gated behind --demo-dummy: this fabricates predictions from a
+        #    hand-written formula, not from any trained model. Off by default.
+        if demo_dummy:
+            def dummy_model(x_dropped: np.ndarray) -> np.ndarray:
+                """
+                Placeholder model: replace with real model.predict_proba() in Phase 4+.
+                For now simulates a slight directional edge using log returns.
+                """
+                n    = x_dropped.shape[0]
+                # Use first feature (log return) as weak signal
+                ret  = x_dropped[:, 0] if x_dropped.shape[1] > 0 else np.zeros(n)
+                # Build 3-class softmax: [down, flat, up]
+                up   = np.clip(0.35 + ret * 5, 0.05, 0.85)
+                down = np.clip(0.35 - ret * 5, 0.05, 0.85)
+                flat = np.clip(1.0 - up - down, 0.05, 0.90)
+                proba = np.column_stack([down, flat, up])
+                proba = proba / proba.sum(axis=1, keepdims=True)
+                return proba
 
-        features    = build_hmm_features(df_labelled)
-        mc_result   = mc_dropout_numpy(
-            pred_proba_fn = dummy_model,
-            x             = features,
-            n_passes      = MC_PASSES,
-            dropout_rate  = MC_DROPOUT_RATE,
-            threshold     = UNCERTAINTY_THRESHOLD,
-        )
+            features    = build_hmm_features(df_labelled)
+            mc_result   = mc_dropout_numpy(
+                pred_proba_fn = dummy_model,
+                x             = features,
+                n_passes      = MC_PASSES,
+                dropout_rate  = MC_DROPOUT_RATE,
+                threshold     = UNCERTAINTY_THRESHOLD,
+            )
 
-        df_labelled["uncertainty"]      = mc_result["uncertainty"]
-        df_labelled["up_proba"]         = mc_result["up_proba"]
-        df_labelled["pred_direction"]   = (mc_result["pred_direction"] == 2).astype(int)
-        df_labelled["high_uncertainty"] = mc_result["high_uncertainty"].astype(int)
+            df_labelled["uncertainty"]      = mc_result["uncertainty"]
+            df_labelled["up_proba"]         = mc_result["up_proba"]
+            df_labelled["pred_direction"]   = (mc_result["pred_direction"] == 2).astype(int)
+            df_labelled["high_uncertainty"] = mc_result["high_uncertainty"].astype(int)
 
         # 5. Save regimes to DB
         if save_to_db_flag:
@@ -656,10 +659,10 @@ def run_regime_pipeline(
             json.dump([asdict(s) for s in stats], f, indent=2)
         logger.info(f"  Stats saved → {stats_path}")
 
-    # 7. Export combined CSV (ready for evaluation.py)
-    if export_csv and all_tagged:
+    # 7. Export combined CSV — SYNTHETIC placeholder output, opt-in only.
+    if demo_dummy and export_csv and all_tagged:
         combined = pd.concat(all_tagged, ignore_index=True)
-        csv_path = f"{output_dir}/regime_tagged_predictions.csv"
+        csv_path = f"{output_dir}/SYNTHETIC_DO_NOT_EVALUATE_regime_predictions.csv"
 
         # Build evaluation.py-compatible columns
         eval_df = combined[["date", "ticker", "close", "regime",
@@ -670,11 +673,14 @@ def run_regime_pipeline(
         )
         eval_df["pred_proba"] = eval_df["up_proba"]
         eval_df = eval_df.dropna(subset=["actual_return"])
+        eval_df.insert(0, "IS_SYNTHETIC", 1)
 
         eval_df.to_csv(csv_path, index=False)
-        logger.info(f"\n✅ Regime-tagged predictions exported → {csv_path}")
-        logger.info(f"   Plug this directly into evaluation.py:")
-        logger.info(f"   python evaluation.py --csv {csv_path} --uncertainty-filter")
+        logger.warning(
+            f"\n⚠️  SYNTHETIC placeholder output written → {csv_path}\n"
+            f"   Produced by the dummy_model formula, NOT by any trained model.\n"
+            f"   This is NOT a result. Never pass it to evaluation.py or quote it."
+        )
 
         _print_uncertainty_summary(eval_df)
 
@@ -821,6 +827,9 @@ if __name__ == "__main__":
                         help="Don't write regime labels back to DB")
     parser.add_argument("--out",    type=str, default="results",
                         help="Output directory for CSVs and stats")
+    parser.add_argument("--demo-dummy", action="store_true",
+                        help="Also emit SYNTHETIC placeholder predictions from dummy_model. "
+                             "These are fabricated, NOT results, and must never be evaluated.")
     args = parser.parse_args()
 
     if args.demo:
@@ -831,6 +840,7 @@ if __name__ == "__main__":
             all_tickers=True,
             save_to_db_flag=not args.no_save,
             output_dir=args.out,
+            demo_dummy=args.demo_dummy,
         )
     elif args.ticker:
         run_regime_pipeline(
@@ -838,6 +848,7 @@ if __name__ == "__main__":
             ticker=args.ticker,
             save_to_db_flag=not args.no_save,
             output_dir=args.out,
+            demo_dummy=args.demo_dummy,
         )
     else:
         print("⚠️  Specify --ticker AAPL, --all, or --demo")

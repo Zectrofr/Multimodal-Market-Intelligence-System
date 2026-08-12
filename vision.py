@@ -170,6 +170,24 @@ def run_vision_pipeline():
 
     # Save to DB
     visual_df = pd.DataFrame(results)
+
+    # ── Fail-closed guard (see docs/STATE_REPORT.md): the write below DROPs and
+    # recreates visual_features. Regenerating is expensive but NOT irreversible.
+    import sqlite3 as _sqlite3
+    try:
+        _con = _sqlite3.connect("file:data/mmis.db?mode=ro", uri=True)
+        _existing = _con.execute("SELECT COUNT(*) FROM visual_features").fetchone()[0]
+        _con.close()
+    except _sqlite3.Error:
+        _existing = 0
+    if _existing > 0 and os.environ.get("MMIS_ALLOW_DESTRUCTIVE") != "1":
+        raise RuntimeError(
+            f"REFUSING TO RUN: would DROP visual_features, destroying {_existing} rows. "
+            "Regenerating these EfficientNet vectors is expensive on this CPU-only build "
+            "(torch 2.12.0+cpu, cuda unavailable) but is NOT irreversible. "
+            "Set MMIS_ALLOW_DESTRUCTIVE=1 to override."
+        )
+
     visual_df.to_sql("visual_features", con=engine, if_exists="replace", index=False)
 
     logger.info(f"\n✅ Vision pipeline complete")

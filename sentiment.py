@@ -149,6 +149,24 @@ def run_sentiment_pipeline():
         time.sleep(0.2)  # Rate limiting
 
     sentiment_df = pd.DataFrame(results)
+
+    # ── Fail-closed guard (see docs/STATE_REPORT.md D8): the write below DROPs
+    # and recreates sentiment_data. Its 2026-05-12..2026-06-10 rows came from a
+    # NewsAPI free tier serving only ~30 days and can never be re-fetched.
+    import sqlite3 as _sqlite3
+    try:
+        _con = _sqlite3.connect("file:data/mmis.db?mode=ro", uri=True)
+        _existing = _con.execute("SELECT COUNT(*) FROM sentiment_data").fetchone()[0]
+        _con.close()
+    except _sqlite3.Error:
+        _existing = 0
+    if _existing > 0 and os.environ.get("MMIS_ALLOW_DESTRUCTIVE") != "1":
+        raise RuntimeError(
+            f"REFUSING TO RUN: would DROP sentiment_data, destroying {_existing} rows spanning "
+            "2026-05-12 to 2026-06-10. That NewsAPI free-tier window can no longer be re-fetched, "
+            "so the loss is PERMANENT. Set MMIS_ALLOW_DESTRUCTIVE=1 to override."
+        )
+
     sentiment_df.to_sql("sentiment_data", con=engine, if_exists="replace", index=False)
 
     logger.info(f"\n✅ Sentiment pipeline complete")
