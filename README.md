@@ -1,4 +1,5 @@
 # MMIS — Multimodal Market Intelligence System
+[![tests](https://github.com/Zectrofr/Fincorp/actions/workflows/tests.yml/badge.svg)](https://github.com/Zectrofr/Fincorp/actions/workflows/tests.yml)
 
 A research platform for forecasting **forward realized volatility** — classifying the coming
 window as calm, normal, or turbulent — with calibrated uncertainty, and for measuring **which
