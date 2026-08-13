@@ -1,0 +1,60 @@
+# MMIS test suite.
+#
+# Every artifact this project produces is gitignored — data/mmis.db, results/,
+# models/ — so a CI runner checks out source code only. The tests that depend on
+# those artifacts SKIP rather than fail (see tests/conftest.py); that is intended
+# behaviour, not a silent pass. What actually runs here is the part that needs no
+# artifacts: the pure metric functions in evaluation.py, the fail-closed guards
+# against destructive re-runs, and the regime causality property — including the
+# truncation test that proves no future information reaches a regime label.
+#
+# Dependency cost, measured 2026-08-13: requirements.txt pins torch==2.12.0
+# without encoding a build variant, so ubuntu-latest resolves the CUDA wheel and
+# pulls the nvidia-* stack — roughly 2.5 GB — where the local Windows environment
+# runs the 504 MB CPU build (2.12.0+cpu). The pip cache below makes repeat runs
+# cheap, but it does not help the first run on a new cache key, and any change to
+# requirements.txt invalidates it and pays the full cost again. Installing from
+# the CPU index (--extra-index-url https://download.pytorch.org/whl/cpu) or
+# splitting out a requirements-ci.txt would cut about 2 GB; neither is done here
+# deliberately — this file changes CI only, not the dependency set.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # Single runner, no OS matrix. This project is Windows-only in practice, but
+    # everything under test is pure Python and platform-independent, so one
+    # ubuntu-latest job keeps the signal unambiguous and the run fast. A matrix
+    # would multiply the ~2.5 GB torch install without testing anything new.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          # Keyed on requirements.txt; restores the pip download cache.
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify destructive-write guards
+        run: python scripts/verify_guards.py
+
+      - name: Run test suite
+        # No -x, no --maxfail, no -k, no -m: every test that can run, runs, and
+        # the full result is reported even when something fails early.
+        run: python -m pytest tests/ -v --tb=short
