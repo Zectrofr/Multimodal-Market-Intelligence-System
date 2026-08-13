@@ -1,0 +1,28 @@
+{
+  "annualisation_factor": 15.874507866387544,
+  "annualisation_trading_days": 252,
+  "boundary_convention": "calm: rv < lower; normal: lower <= rv < upper; turbulent: rv >= upper",
+  "ddof": 1,
+  "fitted_at": "2026-08-13T16:11:05.987653+00:00",
+  "horizon": 5,
+  "lower": 0.18390286612477044,
+  "lower_percentile": 33.33,
+  "name_to_id": {
+    "calm": 0,
+    "normal": 1,
+    "turbulent": 2
+  },
+  "per_ticker_rows": {
+    "AAPL": 1250,
+    "AMZN": 1250,
+    "GOOGL": 1250,
+    "MSFT": 1250,
+    "SPY": 1250,
+    "TSLA": 1250
+  },
+  "pooled_across_tickers": true,
+  "pooled_train_rows": 7500,
+  "train_end_date": "2025-03-11",
+  "upper": 0.32590977697139434,
+  "upper_percentile": 66.67
+}
