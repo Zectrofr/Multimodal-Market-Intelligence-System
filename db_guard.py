@@ -7,12 +7,16 @@ through the same import mechanics they already rely on, with no sys.path
 manipulation in production code. scripts\\ is not a package (no __init__.py) and
 importing from it would require exactly that manipulation.
 
-The contract is FAIL CLOSED: every path that cannot positively establish "this
-table is empty" or "the operator explicitly authorised the loss" raises. A
-missing database, a missing table, a locked file, a corrupt page, a wrong
-working directory — all of them raise. None of them is permitted to degrade
-into "0 rows, safe to proceed", which is the failure mode this module exists to
+The contract is FAIL CLOSED: every path that cannot POSITIVELY establish "there
+is nothing here to destroy" or "the operator explicitly authorised the loss"
+raises. A missing database, a locked file, a corrupt page, a wrong working
+directory — all of them raise. None of them is permitted to degrade into
+"0 rows, safe to proceed", which is the failure mode this module exists to
 eliminate.
+
+A table that does not exist yet is the one absence established positively, by a
+successful sqlite_master query rather than by catching an error, so a fresh
+clone can bootstrap. If that query itself fails, the guard raises as usual.
 """
 
 import os
@@ -56,15 +60,12 @@ def assert_safe_to_replace(
     branch. A missing database or a missing table still raises even with the
     override set, because there is nothing to authorise the destruction of.
 
-    Consequence, deliberate and worth knowing: on a fresh clone where
-    sentiment_data / visual_features do not exist yet, these pipelines cannot
-    bootstrap through this guard, and the override will not rescue them. That
-    is the safe direction, but it means a genuine first run needs the table
-    created empty first, e.g.
-
-        CREATE TABLE IF NOT EXISTS sentiment_data (date TEXT, ticker TEXT);
-
-    after which the zero-rows branch lets the run proceed.
+    A table that does not exist yet also returns normally: there is nothing to
+    destroy, so a fresh clone can bootstrap. This is NOT a fail-open path — the
+    absence is established positively by querying sqlite_master, and any error
+    while doing so still raises. A missing DATABASE FILE remains fatal, because
+    that means the process is looking in the wrong place, not that the data is
+    genuinely absent.
     """
     override_active = os.environ.get(OVERRIDE_ENV) == OVERRIDE_VALUE
     resolved = resolve_db_path(db_path)
@@ -86,14 +87,25 @@ def assert_safe_to_replace(
     try:
         con = sqlite3.connect(uri, uri=True)
         try:
-            existing = con.execute(
-                f'SELECT COUNT(*) FROM "{table_name}"'
-            ).fetchone()[0]
+            # Establish absence POSITIVELY. A table that has never been created
+            # holds nothing to destroy, so a first run may proceed; but that
+            # conclusion is reached by a successful query against sqlite_master,
+            # never by catching an error.
+            table_exists = con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type IN ('table', 'view') AND name = ?",
+                (table_name,),
+            ).fetchone()[0] > 0
+            existing = (
+                con.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+                if table_exists
+                else 0
+            )
         finally:
             con.close()
     except Exception as exc:
-        # ANY failure — connection refused, database locked, table missing,
-        # file corrupt, disk error — is fatal. Never swallowed into a default.
+        # ANY failure — connection refused, database locked, file corrupt,
+        # disk error — is fatal. Never swallowed into a default.
         raise RuntimeError(
             f"REFUSING TO RUN: cannot verify it is safe to replace table "
             f"'{table_name}' in {resolved}. The row-count query failed with "

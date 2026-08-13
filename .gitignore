@@ -1,5 +1,9 @@
 .env
 data/mmis.db
+# Pre-change DB snapshots (e.g. mmis.db.pre-T2) and any sqlite sidecar files.
+# NOTE: the line above matches the literal path only, not the data/ directory,
+# so snapshots need their own rule or a 52 MB file becomes committable.
+data/mmis.db.*
 data/images/
 __pycache__/
 *.pyc

@@ -77,16 +77,20 @@ REGIME_NAMES = {
 #  PART 1 — FEATURE ENGINEERING FOR HMM
 # ══════════════════════════════════════════════════════════
 
-def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
+def build_hmm_features_raw(df: pd.DataFrame) -> np.ndarray:
     """
-    Build the observation sequence the HMM is trained on.
+    Build the UNSTANDARDISED observation sequence the HMM is trained on.
     Uses 4 features that best discriminate market regimes:
       1. log_return          — direction signal
       2. rolling_vol_5d      — short-term volatility
       3. rolling_vol_20d     — medium-term volatility
       4. vol_ratio           — vol regime indicator (short/long vol)
 
-    All pulled from columns already in mmis.db via ingest.py.
+    Every feature is derived here from df["close"]; nothing is read from the
+    indicator columns in mmis.db. All four are backward-looking (the rolling
+    windows use only past observations), so this function is causal — the
+    look-ahead in the legacy path comes from the standardisation below, not
+    from here.
     """
     close = df["close"].values.astype(float)
 
@@ -101,13 +105,37 @@ def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
 
     features = np.column_stack([log_ret, vol_5, vol_20, vol_ratio])
 
-    # Standardise — HMM is sensitive to scale
+    return features.astype(np.float64)
+
+
+def standardisation_stats(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Column mean/std of `features`, with degenerate stds clamped to 1.0."""
     means = features.mean(axis=0)
     stds  = features.std(axis=0)
     stds  = np.where(stds < 1e-8, 1.0, stds)
-    features = (features - means) / stds
+    return means, stds
 
-    return features.astype(np.float64)
+
+def apply_standardisation(
+    features: np.ndarray, means: np.ndarray, stds: np.ndarray
+) -> np.ndarray:
+    """Apply PRE-COMPUTED standardisation statistics. No statistics are
+    estimated here, so the caller controls exactly which rows informed them."""
+    return ((features - means) / stds).astype(np.float64)
+
+
+def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
+    """
+    Legacy (NON-CAUSAL) feature builder — standardises on FULL-SAMPLE mean/std,
+    so the value at day t depends on data through the end of the series. This
+    is defect U4(1) in docs/STATE_REPORT.md §5 and is retained unchanged because
+    the existing market_data.regime / regime_id columns and the demo paths were
+    produced with it. The causal path uses build_hmm_features_raw() plus
+    train-only statistics instead — see regime_causal.py.
+    """
+    features = build_hmm_features_raw(df)
+    means, stds = standardisation_stats(features)
+    return apply_standardisation(features, means, stds)
 
 
 # ══════════════════════════════════════════════════════════
@@ -837,9 +865,16 @@ if __name__ == "__main__":
     parser.add_argument("--demo-dummy", action="store_true",
                         help="Also emit SYNTHETIC placeholder predictions from dummy_model. "
                              "These are fabricated, NOT results, and must never be evaluated.")
+    parser.add_argument("--causal", action="store_true",
+                        help="Run the CAUSAL regime pipeline (T2): train-only HMM fit, "
+                             "filtered decoding, written to the regime_causal / "
+                             "regime_id_causal shadow columns. Leaves regime/regime_id alone.")
     args = parser.parse_args()
 
-    if args.demo:
+    if args.causal:
+        from regime_causal import run_causal_regime_pipeline
+        run_causal_regime_pipeline(db_path=args.db, save_to_db_flag=not args.no_save)
+    elif args.demo:
         run_demo()
     elif args.all:
         run_regime_pipeline(
