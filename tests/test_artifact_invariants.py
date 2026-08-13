@@ -160,6 +160,19 @@ def test_six_legacy_hmm_pickles_exist():
     require(models, "models/")
     found = sorted(p.name for p in models.glob("hmm_*.pkl")
                    if not p.name.startswith("hmm_causal_"))
+    if not found:
+        # The require() above is NOT sufficient on a bare checkout. models/ is
+        # gitignored and absent from a fresh clone, but regime.py:66-67 runs
+        #     MODEL_DIR = Path("models"); MODEL_DIR.mkdir(exist_ok=True)
+        # at MODULE IMPORT time. pytest imports test_regime_causality.py during
+        # collection, which imports regime_causal, which imports regime — so an
+        # empty models/ exists before any test body runs, and a directory-
+        # existence guard sees it and lets this test through to fail on the
+        # glob. Guarding on the FILES, as test_six_causal_hmm_pickles_exist
+        # already does, is what actually distinguishes "no artifacts here" from
+        # "artifacts are missing". The assertion below is unchanged, so this
+        # stays exact wherever the pickles do exist.
+        pytest.skip("legacy HMM pickles not present (gitignored)")
     assert found == [f"hmm_{t}.pkl" for t in TICKERS]
 
 
