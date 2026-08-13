@@ -32,7 +32,18 @@ MARKET_DATA_COLUMNS = [
     # T2 shadow columns — causal regime labels, added by regime_causal.py.
     # The two above are deliberately left untouched for comparison.
     "regime_causal", "regime_id_causal",
+    # T3 shadow columns — forward volatility target, added by rv_target.py.
+    # `target` above is likewise left untouched for comparison.
+    "fwd_rv_5d", "vol_target", "vol_target_id",
 ]
+
+# The only columns in this database permitted to hold NULL, and the reason they
+# are: a 5-day FORWARD label does not exist for the last 5 rows of a ticker.
+# Representing that absence as NULL is the entire point (U3 — ingest.py:135-140
+# instead defaults its final row to 1/Flat, fabricating six labels). Their NULL
+# count is not merely allowed but pinned exactly, in
+# test_t3_columns_hold_exactly_thirty_nulls_on_the_final_rows below.
+T3_NULLABLE_COLUMNS = ["fwd_rv_5d", "vol_target", "vol_target_id"]
 
 # regime.py:69-73 inverted — the fixed name->id map every ticker must honour.
 CAUSAL_NAME_TO_ID = {"mean_reverting": 0, "trending": 1, "high_vol": 2}
@@ -73,19 +84,20 @@ def test_table_row_counts(scalar, table, expected):
     assert scalar(f"SELECT COUNT(*) FROM {table}") == expected
 
 
-def test_market_data_has_46_columns_with_exact_names(q):
-    """Was 44 before T2; C1 appended regime_causal and regime_id_causal.
+def test_market_data_has_49_columns_with_exact_names(q):
+    """Was 44 before T2, 46 after it; T3's C1 appended three more.
 
-    Renamed from test_market_data_has_44_columns_with_exact_names. The exact
+    Renamed from test_market_data_has_46_columns_with_exact_names. The exact
     name list is still asserted in full — this pins the new shape, it does not
     loosen the check.
     """
     cols = columns_of(q, "market_data")
-    assert len(cols) == 46
+    assert len(cols) == 49
     assert cols == MARKET_DATA_COLUMNS
     # The originals keep their ordinal positions; the new ones are appended.
     assert cols[42:44] == ["regime", "regime_id"]
-    assert cols[44:] == ["regime_causal", "regime_id_causal"]
+    assert cols[44:46] == ["regime_causal", "regime_id_causal"]
+    assert cols[46:] == ["fwd_rv_5d", "vol_target", "vol_target_id"]
 
 
 def test_chart_images_exists_but_is_dead(scalar, q):
@@ -160,10 +172,52 @@ def test_no_duplicate_date_ticker_pairs(scalar):
 
 @pytest.mark.parametrize("table", POPULATED_TABLES)
 def test_zero_nulls_in_every_column(q, scalar, table):
-    """§3.5: 0 NULLs in all 44 + 7 + 4 columns."""
+    """§3.5: 0 NULLs in all 46 + 7 + 4 columns, plus T3's three by exception.
+
+    Was "all 44 + 7 + 4". The three T3 forward-label columns are excluded here
+    and asserted SEPARATELY and more strictly below — exact count, exact rows —
+    because for them NULL is the correct value on 30 rows rather than a defect.
+    Every other column, including all 46 that existed before T3, is still held
+    to zero NULLs by the loop below, so this is narrower in scope and not weaker
+    in force.
+    """
     for col in columns_of(q, table):
+        if table == "market_data" and col in T3_NULLABLE_COLUMNS:
+            continue
         assert scalar(f'SELECT COUNT(*) FROM {table} WHERE "{col}" IS NULL') == 0, \
             f"{table}.{col} contains NULLs"
+
+
+def test_t3_columns_hold_exactly_thirty_nulls_on_the_final_rows(q, scalar):
+    """The exception carved out above, pinned exactly rather than waived.
+
+    A 5-day forward label cannot exist for the last 5 rows of a ticker. Those
+    rows — 5 x 6 tickers = 30 — must be NULL, on the same rows in all three
+    columns, and nowhere else. Anything else means either a fabricated label
+    (U3's failure mode) or a gap in the middle of the series.
+    """
+    for col in T3_NULLABLE_COLUMNS:
+        assert scalar(f"SELECT COUNT(*) FROM market_data WHERE {col} IS NULL") == 30, \
+            f"market_data.{col} does not hold exactly 30 NULLs"
+
+    # All three NULL on identical rows — never a label without its RV, or vice versa.
+    assert scalar(
+        "SELECT COUNT(*) FROM market_data WHERE "
+        "(fwd_rv_5d IS NULL) <> (vol_target IS NULL) "
+        "OR (vol_target IS NULL) <> (vol_target_id IS NULL)"
+    ) == 0
+
+    # And they are the final five rows of each ticker, not an interior gap.
+    for (ticker,) in q("SELECT DISTINCT ticker FROM market_data ORDER BY ticker"):
+        nulls = [r[0] for r in q(
+            "SELECT date FROM market_data WHERE ticker=? AND vol_target IS NULL "
+            "ORDER BY date", (ticker,)
+        )]
+        tail = [r[0] for r in q(
+            "SELECT date FROM market_data WHERE ticker=? ORDER BY date DESC LIMIT 5",
+            (ticker,)
+        )]
+        assert nulls == sorted(tail), f"{ticker}: NULLs are not the final five rows"
 
 
 def test_regime_column_is_fully_populated_with_three_labels(q, scalar):
