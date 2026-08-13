@@ -45,7 +45,6 @@ Fincorp\
   .env  .gitignore  README.md  requirements.txt  mlflow.db
   evaluation.py  fusion.py  regime.py  ingest.py  live_inference.py
   inference.py  vision.py  sentiment.py  gradcam.py
-  .claude\      settings.local.json
   .vscode\      settings.json
   api\          __init__.py  main.py  __pycache__\
   dashboard\    app.py  __pycache__\
@@ -151,7 +150,6 @@ Agreement between pins and installed:
 | `config.py` / `settings.yaml` | No | — |
 | `.gitignore` (16 lines) | Yes | ignores `.env`, `data/mmis.db`, `data/images/`, `__pycache__/`, `mlruns/`, `mlflow.db`, `models/*.pt`, `models/*.pkl`, `results/` |
 | `.vscode\settings.json` | Yes | `python-envs.defaultEnvManager` = system interpreter |
-| `.claude\settings.local.json` | Yes | permissions allowlist only; no secrets, no hooks |
 
 Env vars read from the process environment (not `.env`): `MMIS_SEED` default `"42"` (`fusion.py:43`), `MMIS_API_URL` default `http://127.0.0.1:8000` (`dashboard\app.py:16`).
 
