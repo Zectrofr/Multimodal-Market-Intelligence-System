@@ -68,13 +68,35 @@ def test_guard_raises_when_database_file_does_not_exist(tmp_path):
     assert "REFUSING TO RUN" in str(err.value)
 
 
-def test_guard_raises_when_table_does_not_exist(tmp_path):
-    """FAIL CLOSED: a missing table is unverifiable, never 'zero rows'."""
+def test_guard_returns_when_table_does_not_exist(tmp_path):
+    """A table that was never created holds nothing to destroy, so a first run
+    may proceed. Renamed from test_guard_raises_when_table_does_not_exist: T1
+    made this raise, which meant sentiment.py and vision.py could never
+    bootstrap on a fresh clone. T2 reverses it deliberately.
+
+    This is not a fail-open path — absence is established by a SUCCESSFUL
+    sqlite_master query, not by catching an error.
+    """
     db = make_db(tmp_path / "x.db", rows=3, table="other")
+    assert assert_safe_to_replace("t", db_path=str(db), human_reason="why") is None
+
+
+def test_guard_still_protects_the_other_tables_when_one_is_missing(tmp_path):
+    """The bootstrap allowance is per-table, not a blanket pass."""
+    db = make_db(tmp_path / "x.db", rows=3, table="other")
+    assert assert_safe_to_replace("t", db_path=str(db), human_reason="why") is None
+    with pytest.raises(RuntimeError):
+        assert_safe_to_replace("other", db_path=str(db), human_reason="why")
+
+
+def test_missing_table_is_established_positively_not_by_catching_an_error(tmp_path):
+    """A corrupt file must still raise, proving the missing-table return is not
+    just a swallowed OperationalError under another name."""
+    bogus = tmp_path / "corrupt2.db"
+    bogus.write_bytes(b"not a database at all" * 40)
     with pytest.raises(RuntimeError) as err:
-        assert_safe_to_replace("t", db_path=str(db), human_reason="why")
+        assert_safe_to_replace("anything", db_path=str(bogus), human_reason="why")
     assert "row-count query failed" in str(err.value)
-    assert "OperationalError" in str(err.value)
 
 
 def test_guard_raises_when_the_file_is_not_a_database(tmp_path):

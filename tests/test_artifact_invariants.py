@@ -144,16 +144,37 @@ def test_serving_triple_is_complete():
     assert len(SERVING_TRIPLE) == 3
 
 
-def test_six_hmm_pickles_exist():
-    """§6: six per-ticker HMMs. Per U12 these cannot be unpickled under uvicorn,
-    which is why this test checks existence only and never loads them."""
+TICKERS = ["AAPL", "AMZN", "GOOGL", "MSFT", "SPY", "TSLA"]
+
+
+def test_six_legacy_hmm_pickles_exist():
+    """§6: six per-ticker HMMs from the legacy acausal path. Per U12 these
+    cannot be unpickled under uvicorn, which is why this test checks existence
+    only and never loads them.
+
+    Widened from test_six_hmm_pickles_exist, whose `hmm_*.pkl` glob started
+    matching T2's new hmm_causal_*.pkl files. Both sets are now asserted
+    explicitly, so the check is stricter than the one it replaces.
+    """
     models = PROJECT_ROOT / "models"
     require(models, "models/")
-    found = sorted(p.name for p in models.glob("hmm_*.pkl"))
-    assert found == [
-        "hmm_AAPL.pkl", "hmm_AMZN.pkl", "hmm_GOOGL.pkl",
-        "hmm_MSFT.pkl", "hmm_SPY.pkl", "hmm_TSLA.pkl",
-    ]
+    found = sorted(p.name for p in models.glob("hmm_*.pkl")
+                   if not p.name.startswith("hmm_causal_"))
+    assert found == [f"hmm_{t}.pkl" for t in TICKERS]
+
+
+def test_six_causal_hmm_pickles_exist():
+    """T2: one causal model per ticker, carrying its own train-only
+    standardisation statistics and state map. Existence and non-emptiness only
+    — nothing here unpickles them."""
+    models = PROJECT_ROOT / "models"
+    require(models, "models/")
+    found = sorted(p.name for p in models.glob("hmm_causal_*.pkl"))
+    if not found:
+        pytest.skip("causal HMM pickles not present (gitignored)")
+    assert found == [f"hmm_causal_{t}.pkl" for t in TICKERS]
+    for name in found:
+        assert (models / name).stat().st_size > 0
 
 
 def test_synthetic_predictions_are_quarantined():

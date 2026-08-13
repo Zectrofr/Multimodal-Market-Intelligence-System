@@ -29,7 +29,13 @@ MARKET_DATA_COLUMNS = [
     "day_of_year_sin", "day_of_year_cos", "month_sin", "month_cos",
     "time_idx", "group_id", "target", "split", "created_at",
     "regime", "regime_id",
+    # T2 shadow columns — causal regime labels, added by regime_causal.py.
+    # The two above are deliberately left untouched for comparison.
+    "regime_causal", "regime_id_causal",
 ]
+
+# regime.py:69-73 inverted — the fixed name->id map every ticker must honour.
+CAUSAL_NAME_TO_ID = {"mean_reverting": 0, "trending": 1, "high_vol": 2}
 
 EXPECTED_ROWS = {
     "market_data": 9412,
@@ -67,10 +73,19 @@ def test_table_row_counts(scalar, table, expected):
     assert scalar(f"SELECT COUNT(*) FROM {table}") == expected
 
 
-def test_market_data_has_44_columns_with_exact_names(q):
+def test_market_data_has_46_columns_with_exact_names(q):
+    """Was 44 before T2; C1 appended regime_causal and regime_id_causal.
+
+    Renamed from test_market_data_has_44_columns_with_exact_names. The exact
+    name list is still asserted in full — this pins the new shape, it does not
+    loosen the check.
+    """
     cols = columns_of(q, "market_data")
-    assert len(cols) == 44
+    assert len(cols) == 46
     assert cols == MARKET_DATA_COLUMNS
+    # The originals keep their ordinal positions; the new ones are appended.
+    assert cols[42:44] == ["regime", "regime_id"]
+    assert cols[44:] == ["regime_causal", "regime_id_causal"]
 
 
 def test_chart_images_exists_but_is_dead(scalar, q):
@@ -255,6 +270,91 @@ def test_regime_id_marginals_do_not_reconcile_with_regime_U1(q):
 
     # If the contract held, these two would be the same multiset of counts.
     assert sorted(by_name.values()) != sorted(by_id.values())
+
+
+# ══════════════════════════════════════════════════════════════════
+#  T2 shadow columns — causal regime labels
+# ══════════════════════════════════════════════════════════════════
+
+def test_causal_regime_columns_are_fully_populated(scalar, q):
+    assert scalar("SELECT COUNT(*) FROM market_data WHERE regime_causal IS NULL") == 0
+    assert scalar("SELECT COUNT(*) FROM market_data WHERE regime_id_causal IS NULL") == 0
+    names = {r[0] for r in q("SELECT DISTINCT regime_causal FROM market_data")}
+    assert names == set(CAUSAL_NAME_TO_ID)
+    ids = {r[0] for r in q("SELECT DISTINCT regime_id_causal FROM market_data")}
+    assert ids == set(CAUSAL_NAME_TO_ID.values())
+
+
+def test_causal_regime_id_honours_the_contract_on_every_row(scalar):
+    """U1 is FIXED in the shadow columns: 100%, not 70.82%.
+
+    Derived from CAUSAL_NAME_TO_ID rather than hardcoded, so the test tracks the
+    contract rather than a snapshot of it.
+    """
+    clauses = " OR ".join(
+        f"(regime_id_causal = {rid} AND regime_causal = '{name}')"
+        for name, rid in CAUSAL_NAME_TO_ID.items()
+    )
+    total = scalar("SELECT COUNT(*) FROM market_data")
+    honouring = scalar(f"SELECT COUNT(*) FROM market_data WHERE {clauses}")
+    assert honouring == total == 9412
+    assert 100.0 * honouring / total == 100.0
+
+
+def test_causal_name_to_id_mapping_is_identical_across_tickers(q):
+    """The whole point of the U1 fix: regime_id_causal N means the same regime
+    on every ticker, unlike regime_id."""
+    per_ticker = {}
+    for ticker, name, rid in q(
+        "SELECT DISTINCT ticker, regime_causal, regime_id_causal FROM market_data"
+    ):
+        per_ticker.setdefault(ticker, {})[name] = rid
+
+    assert len(per_ticker) == 6
+    for ticker, mapping in per_ticker.items():
+        assert mapping == CAUSAL_NAME_TO_ID, f"{ticker} disagrees: {mapping}"
+
+    # Exactly one distinct mapping across all six — contrast with the old
+    # columns, which have three.
+    assert len({tuple(sorted(m.items())) for m in per_ticker.values()}) == 1
+
+
+def test_causal_marginals_agree_between_name_and_id(q):
+    """A consequence of the fixed map: the two columns' marginal distributions
+    are the same multiset. The legacy pair fails this (see the U1 tests)."""
+    by_name = dict(q("SELECT regime_causal, COUNT(*) FROM market_data GROUP BY 1"))
+    by_id = dict(q("SELECT regime_id_causal, COUNT(*) FROM market_data GROUP BY 1"))
+    assert sorted(by_name.values()) == sorted(by_id.values())
+    for name, rid in CAUSAL_NAME_TO_ID.items():
+        assert by_name[name] == by_id[rid]
+
+
+def test_causal_labels_differ_substantially_from_the_legacy_labels(scalar):
+    """If the causal path had reproduced the acausal one, the leak would not
+    have been removed. Agreement is ~73%, well under the 95% suspicion line
+    agreed for T2."""
+    total = scalar("SELECT COUNT(*) FROM market_data")
+    agreeing = scalar(
+        "SELECT COUNT(*) FROM market_data WHERE regime_causal = regime"
+    )
+    agreement = 100.0 * agreeing / total
+    assert agreeing == 6887
+    assert agreement == pytest.approx(73.1725, abs=0.01)
+    assert agreement < 95.0, "suspiciously high agreement — is the leak still there?"
+
+
+def test_legacy_regime_columns_were_not_modified_by_T2(q, scalar):
+    """The shadow-column design only works if the originals are untouched.
+
+    Pins the exact legacy distributions measured before T2 ran.
+    """
+    assert dict(q("SELECT regime, COUNT(*) FROM market_data GROUP BY regime")) == {
+        "mean_reverting": 3834, "trending": 3683, "high_vol": 1895,
+    }
+    assert dict(q("SELECT regime_id, COUNT(*) FROM market_data GROUP BY regime_id")) == {
+        0: 3754, 1: 3149, 2: 2509,
+    }
+    assert scalar("SELECT COUNT(*) FROM market_data WHERE regime IS NULL") == 0
 
 
 @pytest.mark.defect
