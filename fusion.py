@@ -25,6 +25,9 @@ import mlflow.pytorch
 import pickle
 from pathlib import Path
 import warnings
+# Boundary IMPORTED, never restated, so this file cannot drift from
+# regime_causal / rv_target. Transitively pulls in regime.py and hmmlearn.
+from regime_causal import TRAIN_END_DATE
 warnings.filterwarnings("ignore")
 
 # ── Logging ──────────────────────────────────────────────────
@@ -66,6 +69,17 @@ EPOCHS = 30
 LR = 1e-4
 DROPOUT = 0.3
 MLFLOW_EXPERIMENT = "mmis_fusion"
+
+# ── Embargo at the train/validation seam ──────────────────────
+# The last EMBARGO_DAYS training DATES are dropped, because their labels are
+# drawn from dates that sit in validation. The correct value is the forward
+# horizon of the TARGET:
+#   * market_data.target (CURRENT)  — next-day direction  -> 1 day.
+#   * market_data.vol_target (T5)   — 5-day forward RV    -> T5 MUST set 5.
+# Leaving this at 1 after switching the target to vol_target would leak four
+# days of validation outcomes into the training labels. See docs/STATE_REPORT.md
+# D1 for the one-day overlap this closes, and results/T5_PREP_SPLIT_PIN.md.
+EMBARGO_DAYS = 1
 
 # Fixed order for regime one-hot encoding
 REGIME_ORDER = ["mean_reverting", "trending", "high_vol"]
@@ -403,6 +417,49 @@ def fit_temperature(logits: torch.Tensor, labels: torch.Tensor) -> float:
     opt.step(closure)
     return float(T.detach().clamp(min=1e-3).item())
 
+# ── Temporal Split ────────────────────────────────────────────
+def temporal_split(df, train_end_date=TRAIN_END_DATE, embargo_days=EMBARGO_DAYS):
+    """Cut train/validation on a fixed DATE, never on a row-count fraction.
+
+    Replaces `int(len(df) * 0.8)`, which MOVED whenever visual_features gained
+    or lost rows, and which cut INSIDE a date — 2025-03-17 put five tickers in
+    train and TSLA in validation, decided by alphabetical order. Here every row
+    of a date lands on the same side. Index/order inherited from `df`.
+    """
+    dates = pd.to_datetime(df["date"]).dt.normalize()
+    boundary = pd.Timestamp(train_end_date).normalize()
+    train_mask, val_mask = dates <= boundary, dates > boundary
+
+    # Whole DATES are embargoed, not rows, so the six tickers stay aligned.
+    embargoed = []
+    if embargo_days > 0:
+        embargoed = list(np.sort(dates[train_mask].unique())[-embargo_days:])
+        train_mask &= ~dates.isin(embargoed)
+
+    train_df, val_df = df[train_mask], df[val_mask]
+    if train_df.empty or val_df.empty:
+        raise ValueError(f"empty side at {boundary.date()}: "
+                         f"{len(train_df)} train / {len(val_df)} val")
+
+    # Fail loudly rather than train on a leaky split — the two properties the
+    # old row-count cut could not guarantee.
+    tr_d = pd.to_datetime(train_df["date"]).dt.normalize()
+    va_d = pd.to_datetime(val_df["date"]).dt.normalize()
+    if tr_d.max() >= va_d.min():
+        raise ValueError(f"overlap: last train {tr_d.max().date()} "
+                         f">= first val {va_d.min().date()}")
+    shared = set(tr_d.unique()) & set(va_d.unique())
+    if shared:
+        raise ValueError(f"{len(shared)} date(s) in BOTH splits: {sorted(shared)[:5]}")
+
+    logger.info(
+        f"Temporal split pinned at {boundary.date()} (embargo {embargo_days}d, "
+        f"{len(embargoed)} date(s) dropped) — train: {tr_d.min().date()}.."
+        f"{tr_d.max().date()} ({len(train_df)} rows) | val: {va_d.min().date()}.."
+        f"{va_d.max().date()} ({len(val_df)} rows)"
+    )
+    return train_df, val_df
+
 # ── Main Training Pipeline ────────────────────────────────────
 def run_fusion_pipeline():
     set_seed(SEED)
@@ -416,13 +473,7 @@ def run_fusion_pipeline():
     df = load_aligned_data(engine)
 
     # ── Temporal split BEFORE scaling (no train→val leakage) ────────
-    split = int(len(df) * 0.8)
-    train_df, val_df = df.iloc[:split], df.iloc[split:]
-    logger.info(
-        f"Temporal split — train: {train_df['date'].min()}..{train_df['date'].max()} "
-        f"({len(train_df)} rows) | val: {val_df['date'].min()}..{val_df['date'].max()} "
-        f"({len(val_df)} rows)"
-    )
+    train_df, val_df = temporal_split(df)
 
     # Fit scalers on TRAIN only, then transform both splits with them
     (m_tr, s_tr, v_tr, y_tr,
