@@ -289,3 +289,11 @@ hits exactly that**: `iter = 200 / 200` against `n_iter=200`, yet the log says c
 other five genuinely converged (AMZN 75, GOOGL 64, MSFT 80, SPY 106, TSLA 112 iterations). The
 log line is therefore reassuring in a case where it should not be. Pre-existing hmmlearn
 behaviour, newly surfaced by T2's log line; not fixed here.
+
+## Deferred: Option B — expanding-window HMM refit
+
+T2 shipped Option A: one HMM per ticker fit on the training period only, applied forward with filtered decoding. Option B — periodic refit (quarterly) on all data up to each point, still filtered — was considered and deliberately deferred, not rejected.
+
+Why A now: it isolates the causality fix so any change in results is attributable to removing leakage rather than to a new fitting regime. B also requires a stable state-matching procedure across every refit, since hmmlearn's raw state indices are re-permuted by EM initialisation — getting that wrong reintroduces U1 in a form that varies across time rather than across tickers, which is harder to detect.
+
+Why B eventually: a regime model fit only on 2020-2025 and applied through 2026+ never sees post-boundary market structure. B mirrors how the system would actually run live. Both should be compared in the ablation harness — 'we tested both and refitting did not change the finding' is a stronger claim than silently choosing one.
