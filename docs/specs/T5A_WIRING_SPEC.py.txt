@@ -1,0 +1,488 @@
+# ============================================================
+# T5A WIRING SPECIFICATION — NOT A PASSING TEST SUITE
+#
+# Status as of 2026-08-16: the code this file tests DOES NOT
+# EXIST. T5a was never applied. See results\T5_STATUS_AUDIT.md.
+#
+# This file was found untracked in tests\ and was breaking
+# pytest collection repo-wide (exit 2, 0 tests run) by
+# importing REGIME_COL and TARGET_COL, which fusion.py does
+# not define.
+#
+# It is preserved here as the ACCEPTANCE SPECIFICATION for
+# T5a. When T5a is implemented, this file is restored to
+# tests\test_t5a_wiring.py and must pass unmodified. Any
+# assertion in it that is loosened during that restoration
+# is a red flag, not a fix.
+# ============================================================
+
+"""CORRECTNESS tests for T5a — the rewiring to the forward volatility target.
+
+Like tests/test_fusion_split.py and tests/test_rv_target.py, these are not
+characterization tests: they say what the wiring SHOULD be and are expected to
+stay green.
+
+T5a is a wiring-only change. It switches fusion.py's label from
+market_data.target (3-class next-day direction) to market_data.vol_target_id
+(3-class forward realized volatility), raises the embargo from 1 to 5 to match
+the new label's horizon, swaps the regime one-hot from the acausal `regime`
+column to `regime_causal`, and reconciles the downstream consumers that were
+coupled to the old row-count split. NOTHING here trains a model, runs an
+inference pass, or executes any pipeline module — only module-level definitions
+and individual functions are touched, always against a READ-ONLY database
+handle.
+
+The negative test at the bottom is the important one: `.reindex(columns=
+REGIME_ORDER)` silently DISCARDS an unrecognised regime and emits an all-zero
+one-hot, indistinguishable from "no regime information". That is defect U15, an
+implicit fourth regime with no exception and no log line. It must raise.
+"""
+
+import ast
+import inspect
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import fusion
+import regime_causal
+from conftest import DB_FILE, require
+from fusion import (EMBARGO_DAYS, REGIME_COL, REGIME_ORDER, TARGET_COL,
+                    prepare_features, temporal_split)
+from regime_causal import TRAIN_END_DATE
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BOUNDARY = pd.Timestamp(TRAIN_END_DATE)
+TICKERS = ["AAPL", "AMZN", "GOOGL", "MSFT", "SPY", "TSLA"]
+
+#: The last 5 rows per ticker have no complete 5-day forward window, so their
+#: label is NULL. 5 x 6 tickers.
+EXPECTED_NULL_LABEL_ROWS = 30
+
+
+def dates_of(frame):
+    return pd.to_datetime(frame["date"]).dt.normalize()
+
+
+@pytest.fixture(scope="module")
+def aligned():
+    """fusion.load_aligned_data's frame, rebuilt READ-ONLY, WITHOUT the NULL drop.
+
+    Deliberately NOT calling load_aligned_data itself, which opens a read-write
+    SQLAlchemy engine against the only copy of this database. An inner join on
+    (date, ticker) against visual_features is exactly equivalent to fusion's
+    left-merge followed by dropna(subset=["feature_vector"]).
+
+    The NULL-label drop is left OUT so the tests below can measure it.
+    """
+    require(DB_FILE, "data/mmis.db")
+    con = sqlite3.connect(f"{DB_FILE.as_uri()}?mode=ro", uri=True)
+    try:
+        market = pd.read_sql(
+            f"SELECT date, ticker, {TARGET_COL}, {REGIME_COL} FROM market_data", con)
+        visual = pd.read_sql("SELECT date, ticker FROM visual_features", con)
+    finally:
+        con.close()
+
+    for frame in (market, visual):
+        frame["date"] = pd.to_datetime(frame["date"]).dt.date
+
+    df = market.merge(visual, on=["date", "ticker"], how="inner")
+    return df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+@pytest.fixture(scope="module")
+def labelled(aligned):
+    """The aligned frame after the NULL-label drop — what fusion actually trains on."""
+    return aligned.dropna(subset=[TARGET_COL]).reset_index(drop=True)
+
+
+def source_of(func):
+    """Executable source of `func`, comments and docstring stripped."""
+    src = inspect.getsource(func)
+    body = "\n".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
+    )
+    parts = body.split('"""')
+    return parts[0] + "".join(parts[2:])
+
+
+# ══════════════════════════════════════════════════════════════════
+#  C-1 — the target
+# ══════════════════════════════════════════════════════════════════
+
+def test_fusion_reads_vol_target_id_not_target():
+    """The label is the forward volatility class, not the next-day direction."""
+    assert TARGET_COL == "vol_target_id"
+    assert TARGET_COL != "target"
+
+
+def test_target_column_is_not_hardcoded_anywhere_in_the_data_path():
+    """The label must flow from the constant, so reverting is one line.
+
+    A literal "target" left in the SQL or in prepare_features would silently
+    keep training on the directional label whatever TARGET_COL says.
+    """
+    for func in (fusion.load_aligned_data, fusion.prepare_features):
+        body = source_of(func)
+        assert '"target"' not in body and "'target'" not in body, (
+            f"{func.__name__} hardcodes the label column instead of using "
+            f"TARGET_COL"
+        )
+        assert "TARGET_COL" in body, f"{func.__name__} never references TARGET_COL"
+
+
+def test_the_label_the_sql_selects_is_the_constant():
+    """Parse the f-string in load_aligned_data and confirm what it interpolates."""
+    body = source_of(fusion.load_aligned_data)
+    assert "{TARGET_COL}" in body, "SQL does not interpolate TARGET_COL"
+    assert "{REGIME_COL}" in body, "SQL does not interpolate REGIME_COL"
+
+
+def test_null_labelled_rows_are_excluded_and_there_are_exactly_thirty(aligned, labelled):
+    """30 rows carry a NULL label; they are DROPPED, never defaulted.
+
+    Defaulting them is defect U3: ingest.py silently stamped each ticker's final
+    unlabelled row as Flat, putting six fabricated labels at the newest dates.
+    """
+    n_null = int(aligned[TARGET_COL].isna().sum())
+    assert n_null == EXPECTED_NULL_LABEL_ROWS
+    assert len(aligned) - len(labelled) == EXPECTED_NULL_LABEL_ROWS
+    assert labelled[TARGET_COL].notna().all()
+
+
+def test_the_null_labels_are_the_last_five_rows_per_ticker(aligned):
+    """Positional check — they are the tail of each series, not scattered."""
+    frame = aligned.sort_values(["ticker", "date"])
+    pos_from_end = frame.groupby("ticker").cumcount(ascending=False)
+    is_null = frame[TARGET_COL].isna()
+
+    assert set(pos_from_end[is_null].unique()) == {0, 1, 2, 3, 4}
+    assert is_null.sum() == EXPECTED_NULL_LABEL_ROWS
+    assert (~is_null[pos_from_end >= 5]).all(), "a NULL label outside the tail"
+    # Every ticker contributes exactly five.
+    assert frame[is_null].groupby("ticker").size().tolist() == [5] * len(TICKERS)
+
+
+def test_no_null_label_survives_into_either_split(labelled):
+    train, val = temporal_split(labelled)
+    for name, frame in (("train", train), ("validation", val)):
+        assert frame[TARGET_COL].notna().all(), f"NULL label in {name}"
+
+
+def test_prepare_features_raises_rather_than_casting_a_null_label():
+    """torch.LongTensor turns NaN into an undefined index instead of raising, so
+    the failure would surface much later as an assert inside the loss."""
+    frame = _feature_frame(n=4)
+    frame.loc[2, TARGET_COL] = np.nan
+
+    with pytest.raises(ValueError, match=r"NULL"):
+        prepare_features(frame)
+
+
+def test_labels_are_integers_in_range(labelled):
+    """Three classes, 0..2, matching NUM_CLASSES and CLASS_NAMES."""
+    vals = labelled[TARGET_COL].dropna().astype(int)
+    assert set(vals.unique()) <= {0, 1, 2}
+    assert vals.min() >= 0 and vals.max() < fusion.NUM_CLASSES
+    assert len(fusion.CLASS_NAMES) == fusion.NUM_CLASSES == 3
+
+
+# ══════════════════════════════════════════════════════════════════
+#  C-2 — the embargo
+# ══════════════════════════════════════════════════════════════════
+
+def test_embargo_is_five():
+    """The new label's forward window is 5 trading days."""
+    assert EMBARGO_DAYS == 5
+
+
+def test_embargo_removes_exactly_five_training_dates(labelled):
+    no_embargo, _ = temporal_split(labelled, embargo_days=0)
+    train, _ = temporal_split(labelled)
+
+    all_dates = sorted(set(dates_of(no_embargo).unique()))
+    kept = sorted(set(dates_of(train).unique()))
+    dropped = [d for d in all_dates if d not in kept]
+
+    assert len(dropped) == 5
+    # They are the LAST five training dates, not an arbitrary subset.
+    assert dropped == all_dates[-5:]
+    # Six tickers per date, so exactly 30 rows.
+    assert len(no_embargo) - len(train) == 30
+
+
+def test_embargoed_rows_land_in_neither_split(labelled):
+    """The embargo bars them from training; they are not after the boundary so
+    they cannot be validation. That is correct, not an oversight."""
+    train, val = temporal_split(labelled)
+    assert len(train) + len(val) == len(labelled) - 30
+
+
+def test_no_training_label_reaches_past_the_boundary(labelled):
+    """The point of the embargo: with a 5-day forward window, the last training
+    date's label must not be drawn from a validation date."""
+    train, _ = temporal_split(labelled)
+    last_train = dates_of(train).max()
+
+    all_dates = sorted(set(dates_of(labelled).unique()))
+    idx = all_dates.index(last_train)
+    # The label at `last_train` reads five trading days forward.
+    window_end = all_dates[idx + 5]
+    assert window_end <= BOUNDARY, (
+        f"label at {last_train.date()} reads through {window_end.date()}, "
+        f"past the boundary {BOUNDARY.date()}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  C-3 — the regime column
+# ══════════════════════════════════════════════════════════════════
+
+def test_fusion_reads_regime_causal_not_regime():
+    assert REGIME_COL == "regime_causal"
+    assert REGIME_COL != "regime"
+
+
+def test_regime_column_is_not_hardcoded_in_the_data_path():
+    for func in (fusion.load_aligned_data, fusion.prepare_features):
+        body = source_of(func)
+        assert "REGIME_COL" in body, f"{func.__name__} never references REGIME_COL"
+        assert '"regime"' not in body and "'regime'" not in body, (
+            f"{func.__name__} hardcodes the legacy regime column"
+        )
+
+
+def test_regime_causal_value_set_equals_regime_order_so_the_onehot_drops_nothing(aligned):
+    """If a value fell outside REGIME_ORDER the reindex would discard it into an
+    all-zero row — an implicit fourth regime (U15)."""
+    observed = set(aligned[REGIME_COL].dropna().unique())
+
+    assert observed == set(REGIME_ORDER), (
+        f"extras={sorted(observed - set(REGIME_ORDER))} "
+        f"missing={sorted(set(REGIME_ORDER) - observed)}"
+    )
+    assert aligned[REGIME_COL].isna().sum() == 0
+
+
+def test_the_onehot_is_exactly_one_hot_on_every_row(aligned):
+    """Every row must carry exactly one 1 — never all-zero, never multi-hot."""
+    onehot = pd.get_dummies(aligned[REGIME_COL]).reindex(
+        columns=REGIME_ORDER, fill_value=0).values.astype(np.float32)
+
+    assert onehot.shape == (len(aligned), len(REGIME_ORDER))
+    assert set(np.unique(onehot.sum(axis=1))) == {1.0}, \
+        "a row's one-hot is all-zero or multi-hot"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  The negative test — an unknown regime must RAISE, not zero out
+# ══════════════════════════════════════════════════════════════════
+
+def _feature_frame(n=6, regime="trending"):
+    """A minimal frame prepare_features accepts: every MARKET_COLS column, a
+    feature_vector blob of the right width, sentiment, label and regime."""
+    rng = np.random.default_rng(0)
+    frame = pd.DataFrame({c: rng.normal(size=n) for c in fusion.MARKET_COLS})
+    frame["sentiment_neg"] = 0.0
+    frame["sentiment_neu"] = 1.0
+    frame["sentiment_pos"] = 0.0
+    frame[REGIME_COL] = regime
+    frame[TARGET_COL] = np.arange(n) % 3
+    frame["feature_vector"] = [
+        rng.normal(size=fusion.VISUAL_DIM).astype(np.float32).tobytes()
+        for _ in range(n)
+    ]
+    return frame
+
+
+def test_prepare_features_accepts_a_clean_frame():
+    """Guards the negative test below: it must fail for the RIGHT reason."""
+    market, sentiment, visual, targets, _, _ = prepare_features(_feature_frame())
+
+    assert market.shape == (6, len(fusion.MARKET_COLS) + len(REGIME_ORDER))
+    assert visual.shape == (6, fusion.VISUAL_DIM)
+    assert targets.dtype == np.int64
+    # The one-hot column for "trending" is set on every row.
+    assert market[:, len(fusion.MARKET_COLS) + REGIME_ORDER.index("trending")].all()
+
+
+@pytest.mark.parametrize("bad", ["unknown", "calm", "HIGH_VOL", ""])
+def test_unknown_regime_raises_instead_of_silently_zeroing_the_onehot(bad):
+    """THE defect this guard exists for (U15).
+
+    `pd.get_dummies(...).reindex(columns=REGIME_ORDER, fill_value=0)` gives an
+    unrecognised value its own dummy column and then DISCARDS it, leaving an
+    all-zero 3-vector that is indistinguishable from "no regime information" —
+    with no exception, no warning and no log line. Note the cases: a plausible
+    typo, a volatility class name, a case variant, and an empty string.
+    """
+    frame = _feature_frame()
+    frame.loc[3, REGIME_COL] = bad
+
+    with pytest.raises(ValueError) as exc:
+        prepare_features(frame)
+
+    message = str(exc.value)
+    assert REGIME_COL in message
+    assert bad in message or repr(bad) in message, \
+        f"the error must name the offending value; got: {message}"
+
+
+def test_the_silent_failure_mode_is_real():
+    """The negative test above cannot pass vacuously: without the guard, the
+    reindex genuinely produces an all-zero row rather than raising."""
+    values = pd.Series(["mean_reverting", "trending", "unknown"])
+    onehot = pd.get_dummies(values).reindex(
+        columns=REGIME_ORDER, fill_value=0).values.astype(np.float32)
+
+    assert onehot[2].sum() == 0.0, \
+        "reindex no longer drops unknown values; the guard's rationale changed"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  C-4 — the downstream consumers
+# ══════════════════════════════════════════════════════════════════
+
+def test_inference_calibration_boundary_equals_fusion_training_boundary():
+    """inference.py must DERIVE its calibration split from fusion, not
+    re-approximate it. It previously used out["date"].quantile(0.80) =
+    2025-03-17, which is not fusion's boundary.
+    """
+    src = (PROJECT_ROOT / "inference.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "fusion"
+        for alias in node.names
+    }
+    assert "temporal_split" in imported, \
+        "inference.py does not import fusion.temporal_split"
+
+    calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "temporal_split" in calls, "inference.py never calls temporal_split"
+
+    # No date-quantile split survives in EXECUTABLE code. Checked via the AST
+    # rather than a text search, because inference.py's comments legitimately
+    # quote `out["date"].quantile(0.80)` when explaining what was replaced —
+    # and because np.quantile(out["uncertainty"], 0.80) at :197 is the
+    # unrelated, still-correct uncertainty percentile.
+    date_quantiles = [
+        ast.get_source_segment(src, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "quantile"
+        and "date" in (ast.get_source_segment(src, node.func.value) or "")
+    ]
+    assert not date_quantiles, \
+        f"inference.py still derives a split from a date quantile: {date_quantiles}"
+
+
+def test_no_calibration_fit_row_is_dated_after_the_training_boundary(labelled):
+    """Reproduce inference.py's calibration frame and confirm the leak is closed.
+
+    inference.py drops the last row per ticker (no next-day actual_return), then
+    splits. Under the old rule 18 rows dated 2025-03-12..14 — fusion VALIDATION
+    data — sat inside the isotonic calibrator's fit.
+    """
+    frame = labelled.sort_values(["ticker", "date"]).reset_index(drop=True)
+    keep = frame.groupby("ticker").cumcount(ascending=False) > 0
+    frame = frame[keep].reset_index(drop=True)
+
+    fit_rows, _ = temporal_split(frame)
+
+    assert dates_of(fit_rows).max() <= BOUNDARY
+    assert int((dates_of(fit_rows) > BOUNDARY).sum()) == 0, \
+        "a calibration fit row is dated after fusion's training boundary"
+
+    # The 18 specific rows the old quantile rule leaked are now excluded.
+    leaked = pd.to_datetime(["2025-03-12", "2025-03-13", "2025-03-14"])
+    assert not dates_of(fit_rows).isin(leaked).any()
+
+
+def test_the_old_quantile_rule_genuinely_leaked(aligned):
+    """The assertion above cannot pass vacuously — the rule it replaced failed.
+
+    Measured on the PRE-NULL-drop frame, which is what HEAD's inference.py saw:
+    at HEAD fusion trained on `target`, which has no NULLs, so no label drop
+    happened. On that 9,286-row frame (after the last-row-per-ticker drop)
+    quantile(0.80) lands on 2025-03-17 and pulls in 18 rows of fusion's
+    validation data. Reproducing it on the post-drop frame would understate the
+    defect, because the NULL drop happens to move the quantile.
+    """
+    frame = aligned.sort_values(["ticker", "date"]).reset_index(drop=True)
+    keep = frame.groupby("ticker").cumcount(ascending=False) > 0
+    frame = frame[keep].reset_index(drop=True)
+    frame["date"] = pd.to_datetime(frame["date"])
+
+    old_boundary = frame["date"].quantile(0.80)
+    old_fit = frame[frame["date"] < old_boundary]
+
+    assert int((dates_of(old_fit) > BOUNDARY).sum()) > 0, \
+        "the old rule did not leak, so this test proves nothing"
+
+
+def test_assert_boundary_matches_fusion_no_longer_reports_a_mismatch():
+    """The repo's own drift detector replayed int(len(rows) * 0.8) — a rule
+    fusion.py stopped using — and logged SPLIT BOUNDARY MISMATCH on every run.
+    """
+    require(DB_FILE, "data/mmis.db")
+    result = regime_causal.assert_boundary_matches_fusion(str(DB_FILE))
+
+    assert result["matches"] is True, result
+    assert result["regime_causal_train_end"] == TRAIN_END_DATE
+    assert result["embargo_days"] == EMBARGO_DAYS
+
+    # The boundary is genuinely bracketed: training ends on or before it,
+    # validation starts strictly after it.
+    last_train = pd.Timestamp(result["fusion_last_train_date"])
+    first_val = pd.Timestamp(result["fusion_first_val_date"])
+    assert last_train <= BOUNDARY < first_val
+
+
+def test_the_drift_detector_still_detects_drift(monkeypatch):
+    """assert_boundary_matches_fusion must not have been made unconditionally
+    true. Move fusion's boundary and it must report a mismatch again."""
+    require(DB_FILE, "data/mmis.db")
+    monkeypatch.setattr(regime_causal, "TRAIN_END_DATE", "2024-06-01")
+
+    result = regime_causal.assert_boundary_matches_fusion(str(DB_FILE))
+    assert result["matches"] is False, \
+        "the detector reports a match against a boundary fusion does not use"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Row counts and class weights — recorded, not performance results
+# ══════════════════════════════════════════════════════════════════
+
+def test_split_row_counts(labelled):
+    """Pins the counts results/T5A_REWIRE.md §2 reports."""
+    train, val = temporal_split(labelled)
+
+    assert len(labelled) == 9262
+    assert len(train) == 7380
+    assert len(val) == 1852
+
+
+def test_class_weights_are_finite_and_non_degenerate(labelled):
+    """No training, no metric — only the weights the loss WOULD be built with."""
+    train, _ = temporal_split(labelled)
+    y = train[TARGET_COL].astype(int).values
+
+    counts = np.bincount(y, minlength=fusion.NUM_CLASSES).astype(float)
+    weights = len(y) / (fusion.NUM_CLASSES * np.clip(counts, 1, None))
+
+    assert len(counts) == fusion.NUM_CLASSES, "a label outside 0..2 appeared"
+    assert (counts > 0).all(), "an empty class would make its weight arbitrary"
+    assert np.isfinite(weights).all()
+    assert weights.max() / weights.min() < 2.0
